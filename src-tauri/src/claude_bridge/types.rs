@@ -235,6 +235,12 @@ pub(crate) struct BridgeState {
     pub(crate) tool_items: std::collections::HashMap<String, ItemInfo>,
     /// Maps content block index → tool_use_id (to find ItemInfo from content block events).
     pub(crate) block_tool_use_ids: std::collections::HashMap<u64, String>,
+    /// Cumulative input tokens across all turns.
+    pub(crate) total_input_tokens: u64,
+    /// Cumulative output tokens across all turns.
+    pub(crate) total_output_tokens: u64,
+    /// Cumulative cost in USD across all turns.
+    pub(crate) total_cost_usd: f64,
 }
 
 impl BridgeState {
@@ -252,6 +258,9 @@ impl BridgeState {
             model: None,
             tool_items: std::collections::HashMap::new(),
             block_tool_use_ids: std::collections::HashMap::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
         }
     }
 

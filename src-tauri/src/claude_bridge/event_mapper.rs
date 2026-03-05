@@ -309,12 +309,23 @@ fn map_content_block_stop(
     out
 }
 
+/// Infer the model context window size from the model name.
+fn context_window_for_model(model: Option<&str>) -> u64 {
+    match model {
+        Some(m) if m.starts_with("claude-haiku") => 200_000,
+        Some(m) if m.starts_with("claude-sonnet") => 200_000,
+        Some(m) if m.starts_with("claude-opus") => 200_000,
+        _ => 200_000,
+    }
+}
+
 fn map_message_delta(
     md: &super::types::MessageDeltaEvent,
     state: &mut BridgeState,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(ref usage) = md.usage {
+        let ctx_window = context_window_for_model(state.model.as_deref());
         out.push(json!({
             "method": "thread/tokenUsage/updated",
             "params": {
@@ -324,6 +335,7 @@ fn map_message_delta(
                     "outputTokens": usage.output_tokens,
                     "cacheCreationInputTokens": usage.cache_creation_input_tokens,
                     "cacheReadInputTokens": usage.cache_read_input_tokens,
+                    "modelContextWindow": ctx_window
                 }
             }
         }));
@@ -343,31 +355,73 @@ fn map_result(
     state: &mut BridgeState,
 ) -> Vec<Value> {
     let mut out = Vec::new();
+    let ctx_window = context_window_for_model(state.model.as_deref());
 
-    // Emit token usage if available
+    // Accumulate totals and emit token usage
     if let Some(ref usage) = res.usage {
+        state.total_input_tokens += usage.input_tokens;
+        state.total_output_tokens += usage.output_tokens;
+
+        let last_total = usage.input_tokens + usage.output_tokens;
+        let grand_total = state.total_input_tokens + state.total_output_tokens;
+
         out.push(json!({
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": state.thread_id,
                 "usage": {
-                    "inputTokens": usage.input_tokens,
-                    "outputTokens": usage.output_tokens,
-                    "cacheCreationInputTokens": usage.cache_creation_input_tokens,
-                    "cacheReadInputTokens": usage.cache_read_input_tokens,
+                    "last": {
+                        "inputTokens": usage.input_tokens,
+                        "outputTokens": usage.output_tokens,
+                        "totalTokens": last_total,
+                        "cachedInputTokens": usage.cache_read_input_tokens.unwrap_or(0),
+                        "reasoningOutputTokens": 0
+                    },
+                    "total": {
+                        "inputTokens": state.total_input_tokens,
+                        "outputTokens": state.total_output_tokens,
+                        "totalTokens": grand_total,
+                        "cachedInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    },
+                    "modelContextWindow": ctx_window
                 }
             }
         }));
     }
 
-    // Emit turn/completed
+    // Accumulate cost
+    if let Some(cost) = res.cost_usd {
+        state.total_cost_usd += cost;
+    }
+
+    // Emit turn/completed with cost and duration
     if state.turn_started {
         out.push(json!({
             "method": "turn/completed",
             "params": {
                 "threadId": state.thread_id,
                 "turnId": state.turn_id,
-                "status": if res.is_error { "error" } else { "completed" }
+                "status": if res.is_error { "error" } else { "completed" },
+                "costUsd": res.cost_usd,
+                "durationMs": res.duration_ms
+            }
+        }));
+    }
+
+    // Emit rate limits with cumulative cost display
+    if state.total_cost_usd > 0.0 {
+        out.push(json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "primary": null,
+                "secondary": null,
+                "credits": {
+                    "hasCredits": true,
+                    "unlimited": false,
+                    "balance": format!("${:.2} spent", state.total_cost_usd)
+                },
+                "planType": "claude-cli"
             }
         }));
     }
@@ -908,5 +962,133 @@ mod tests {
         state.new_turn();
         assert!(state.tool_items.is_empty());
         assert!(state.block_tool_use_ids.is_empty());
+    }
+
+    // ── Phase 4: Model, Cost, Limits & Context Window ────────────
+
+    #[test]
+    fn result_event_accumulates_total_tokens() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event1 = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: Some(0.01),
+            usage: Some(UsageInfo {
+                input_tokens: 100, output_tokens: 50,
+                cache_creation_input_tokens: None, cache_read_input_tokens: None,
+            }),
+            extra: Default::default(),
+        });
+        map_event(&event1, &mut state);
+
+        assert_eq!(state.total_input_tokens, 100);
+        assert_eq!(state.total_output_tokens, 50);
+        assert!((state.total_cost_usd - 0.01).abs() < f64::EPSILON);
+
+        // Second turn
+        state.turn_started = true;
+        let event2 = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: Some(0.02),
+            usage: Some(UsageInfo {
+                input_tokens: 200, output_tokens: 100,
+                cache_creation_input_tokens: None, cache_read_input_tokens: None,
+            }),
+            extra: Default::default(),
+        });
+        map_event(&event2, &mut state);
+
+        assert_eq!(state.total_input_tokens, 300);
+        assert_eq!(state.total_output_tokens, 150);
+        assert!((state.total_cost_usd - 0.03).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn result_event_emits_model_context_window() {
+        let mut state = make_state();
+        state.turn_started = true;
+        state.model = Some("claude-sonnet-4-20250514".to_string());
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: None,
+            usage: Some(UsageInfo {
+                input_tokens: 100, output_tokens: 50,
+                cache_creation_input_tokens: None, cache_read_input_tokens: None,
+            }),
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+
+        let token_msg = msgs.iter()
+            .find(|m| m["method"] == "thread/tokenUsage/updated")
+            .unwrap();
+        assert_eq!(token_msg["params"]["usage"]["modelContextWindow"], 200_000);
+        assert_eq!(token_msg["params"]["usage"]["last"]["totalTokens"], 150);
+        assert_eq!(token_msg["params"]["usage"]["total"]["totalTokens"], 150);
+    }
+
+    #[test]
+    fn result_event_emits_rate_limits_with_cost() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: Some(0.42),
+            usage: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+
+        let rate_msg = msgs.iter()
+            .find(|m| m["method"] == "account/rateLimits/updated")
+            .unwrap();
+        assert_eq!(rate_msg["params"]["credits"]["hasCredits"], true);
+        assert_eq!(rate_msg["params"]["credits"]["balance"], "$0.42 spent");
+        assert_eq!(rate_msg["params"]["planType"], "claude-cli");
+    }
+
+    #[test]
+    fn result_event_includes_cost_in_turn_completed() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: Some(3200), duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: Some(0.05),
+            usage: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+
+        let turn_msg = msgs.iter()
+            .find(|m| m["method"] == "turn/completed")
+            .unwrap();
+        assert_eq!(turn_msg["params"]["costUsd"], 0.05);
+        assert_eq!(turn_msg["params"]["durationMs"], 3200);
+        assert_eq!(turn_msg["params"]["status"], "completed");
+    }
+
+    #[test]
+    fn message_delta_includes_model_context_window() {
+        let mut state = make_state();
+        state.model = Some("claude-opus-4-20250514".to_string());
+
+        let event = ClaudeEvent::MessageDelta(MessageDeltaEvent {
+            delta: None,
+            usage: Some(UsageInfo {
+                input_tokens: 50, output_tokens: 25,
+                cache_creation_input_tokens: None, cache_read_input_tokens: None,
+            }),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs[0]["params"]["usage"]["modelContextWindow"], 200_000);
     }
 }

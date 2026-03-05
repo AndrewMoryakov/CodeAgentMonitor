@@ -60,15 +60,25 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let workspace_id = entry.id.clone();
     let workspace_path = entry.path.clone();
 
+    // Shared model name: updated by event loop, read by interceptor
+    let detected_model: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let detected_model_for_interceptor = detected_model.clone();
+
     // Build the request interceptor for Claude CLI protocol translation
     let interceptor_thread_id = thread_id.clone();
     let interceptor_workspace_id = workspace_id.clone();
     let interceptor: Arc<dyn Fn(Value) -> InterceptAction + Send + Sync> =
         Arc::new(move |value: Value| {
+            let model = detected_model_for_interceptor
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
             build_claude_intercept_action(
                 &value,
                 &interceptor_thread_id,
                 &interceptor_workspace_id,
+                model.as_deref(),
             )
         });
 
@@ -95,6 +105,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let event_sink_stdout = event_sink.clone();
     let ws_id_stdout = workspace_id.clone();
     let stdout_thread_id = thread_id.clone();
+    let detected_model_for_loop = detected_model.clone();
     tokio::spawn(async move {
         let mut bridge_state = BridgeState::new(ws_id_stdout.clone(), stdout_thread_id);
         let mut lines = BufReader::new(stdout).lines();
@@ -119,6 +130,16 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
             };
 
             let codex_messages = event_mapper::map_event(&claude_event, &mut bridge_state);
+
+            // Propagate detected model to the shared interceptor state
+            if let Some(ref model) = bridge_state.model {
+                if let Ok(mut guard) = detected_model_for_loop.lock() {
+                    if guard.as_ref() != Some(model) {
+                        *guard = Some(model.clone());
+                    }
+                }
+            }
+
             for message in codex_messages {
                 let payload = AppServerEvent {
                     workspace_id: ws_id_stdout.clone(),
@@ -162,11 +183,42 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     Ok(session)
 }
 
+/// Format a model ID like "claude-sonnet-4-20250514" into a display name
+/// like "Claude Sonnet 4".
+fn format_model_display_name(model_id: &str) -> String {
+    // Strip date suffix (e.g. "-20250514")
+    let base = if let Some(pos) = model_id.rfind('-') {
+        let suffix = &model_id[pos + 1..];
+        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+            &model_id[..pos]
+        } else {
+            model_id
+        }
+    } else {
+        model_id
+    };
+    // Capitalize each segment
+    base.split('-')
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                None => String::new(),
+                Some(first) => {
+                    let upper: String = first.to_uppercase().collect();
+                    upper + c.as_str()
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Determine how to handle a JSON-RPC message destined for Claude CLI.
 fn build_claude_intercept_action(
     value: &Value,
     thread_id: &str,
     _workspace_id: &str,
+    detected_model: Option<&str>,
 ) -> InterceptAction {
     let method = value
         .get("method")
@@ -279,13 +331,20 @@ fn build_claude_intercept_action(
 
         "model/list" => {
             if let Some(id) = id {
+                let model_id = detected_model.unwrap_or("claude-sonnet-4-20250514");
+                let display_name = format_model_display_name(model_id);
                 InterceptAction::Respond(json!({
                     "id": id,
                     "result": {
                         "data": [{
-                            "id": "claude-sonnet-4-20250514",
-                            "name": "Claude Sonnet 4",
-                            "isDefault": true
+                            "id": model_id,
+                            "model": model_id,
+                            "displayName": display_name,
+                            "name": display_name,
+                            "isDefault": true,
+                            "supportedReasoningEfforts": [],
+                            "defaultReasoningEffort": null,
+                            "description": "Claude CLI"
                         }]
                     }
                 }))
@@ -411,7 +470,7 @@ mod tests {
     #[test]
     fn intercept_initialize_responds_immediately() {
         let action =
-            build_claude_intercept_action(&json!({"id": 1, "method": "initialize"}), "t1", "w1");
+            build_claude_intercept_action(&json!({"id": 1, "method": "initialize"}), "t1", "w1", None);
         match action {
             InterceptAction::Respond(v) => {
                 assert_eq!(v["id"], 1);
@@ -433,6 +492,7 @@ mod tests {
             }),
             "t1",
             "w1",
+            None,
         );
         match action {
             InterceptAction::Forward(text) => assert_eq!(text, "What is Rust?"),
@@ -446,6 +506,7 @@ mod tests {
             &json!({"id": 3, "method": "thread/list"}),
             "thread_abc",
             "ws_1",
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -463,6 +524,7 @@ mod tests {
             &json!({"id": 4, "method": "some/unknown"}),
             "t1",
             "w1",
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -475,7 +537,7 @@ mod tests {
     #[test]
     fn intercept_notification_drops_initialized() {
         let action =
-            build_claude_intercept_action(&json!({"method": "initialized"}), "t1", "w1");
+            build_claude_intercept_action(&json!({"method": "initialized"}), "t1", "w1", None);
         assert!(matches!(action, InterceptAction::Drop));
     }
 
@@ -489,12 +551,51 @@ mod tests {
             }),
             "t1",
             "w1",
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
                 assert!(v["error"].is_object());
             }
             _ => panic!("Expected Respond with error"),
+        }
+    }
+
+    #[test]
+    fn format_model_display_name_strips_date() {
+        assert_eq!(
+            format_model_display_name("claude-sonnet-4-20250514"),
+            "Claude Sonnet 4"
+        );
+        assert_eq!(
+            format_model_display_name("claude-opus-4-20250514"),
+            "Claude Opus 4"
+        );
+    }
+
+    #[test]
+    fn format_model_display_name_without_date() {
+        assert_eq!(
+            format_model_display_name("claude-haiku-4"),
+            "Claude Haiku 4"
+        );
+    }
+
+    #[test]
+    fn intercept_model_list_uses_detected_model() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 10, "method": "model/list"}),
+            "t1",
+            "w1",
+            Some("claude-opus-4-20250514"),
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                let data = v["result"]["data"].as_array().unwrap();
+                assert_eq!(data[0]["model"], "claude-opus-4-20250514");
+                assert_eq!(data[0]["displayName"], "Claude Opus 4");
+            }
+            _ => panic!("Expected Respond"),
         }
     }
 }
