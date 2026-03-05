@@ -598,4 +598,435 @@ mod tests {
             _ => panic!("Expected Respond"),
         }
     }
+
+    // ── Phase 5: Additional interceptor tests ─────────────────────
+
+    #[test]
+    fn intercept_model_list_fallback_when_no_detected_model() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 11, "method": "model/list"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                let data = v["result"]["data"].as_array().unwrap();
+                assert_eq!(data[0]["model"], "claude-sonnet-4-20250514");
+                assert_eq!(data[0]["isDefault"], true);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_turn_steer_forwards_text() {
+        let action = build_claude_intercept_action(
+            &json!({
+                "id": 20,
+                "method": "turn/steer",
+                "params": { "text": "Actually, do this instead" }
+            }),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Forward(text) => assert_eq!(text, "Actually, do this instead"),
+            _ => panic!("Expected Forward"),
+        }
+    }
+
+    #[test]
+    fn intercept_turn_steer_empty_returns_error() {
+        let action = build_claude_intercept_action(
+            &json!({
+                "id": 21,
+                "method": "turn/steer",
+                "params": {}
+            }),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert!(v["error"]["message"].as_str().unwrap().contains("Empty steer"));
+            }
+            _ => panic!("Expected Respond with error"),
+        }
+    }
+
+    #[test]
+    fn intercept_turn_steer_empty_no_id_drops() {
+        let action = build_claude_intercept_action(
+            &json!({
+                "method": "turn/steer",
+                "params": {}
+            }),
+            "t1",
+            "w1",
+            None,
+        );
+        assert!(matches!(action, InterceptAction::Drop));
+    }
+
+    #[test]
+    fn intercept_thread_start_responds_with_thread() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 30, "method": "thread/start"}),
+            "thread_xyz",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["id"], 30);
+                assert_eq!(v["result"]["threadId"], "thread_xyz");
+                assert_eq!(v["result"]["thread"]["status"], "active");
+                assert_eq!(v["result"]["thread"]["name"], "New conversation");
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_thread_resume_responds() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 31, "method": "thread/resume"}),
+            "thread_abc",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["result"]["threadId"], "thread_abc");
+                assert_eq!(v["result"]["thread"]["status"], "active");
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_thread_fork_responds_ok() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 32, "method": "thread/fork"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["id"], 32);
+                assert_eq!(v["result"]["ok"], true);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_thread_archive_responds_ok() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 33, "method": "thread/archive"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_thread_compact_start_responds_ok() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 34, "method": "thread/compact/start"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_thread_name_set_responds_ok() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 35, "method": "thread/name/set"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_review_start_responds_ok() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 36, "method": "review/start"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_skills_list_responds_empty() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 40, "method": "skills/list"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["result"]["data"].as_array().unwrap().len(), 0);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_app_list_responds_empty() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 41, "method": "app/list"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["result"]["data"].as_array().unwrap().len(), 0);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_mcp_server_status_list_responds_empty() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 42, "method": "mcpServerStatus/list"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["result"]["data"].as_array().unwrap().len(), 0);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_experimental_feature_list_responds_empty() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 43, "method": "experimentalFeature/list"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["result"]["data"].as_array().unwrap().len(), 0);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_collaboration_mode_list_responds_empty() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 44, "method": "collaborationMode/list"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["result"]["data"].as_array().unwrap().len(), 0);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_account_read_responds_empty() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 50, "method": "account/read"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["id"], 50);
+                assert!(v["result"].is_object());
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_account_rate_limits_read_responds() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 51, "method": "account/rateLimits/read"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => assert_eq!(v["id"], 51),
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_account_login_start_responds() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 52, "method": "account/login/start"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => assert_eq!(v["id"], 52),
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_turn_interrupt_responds_ok() {
+        let action = build_claude_intercept_action(
+            &json!({"id": 60, "method": "turn/interrupt"}),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["id"], 60);
+                assert_eq!(v["result"]["ok"], true);
+            }
+            _ => panic!("Expected Respond"),
+        }
+    }
+
+    #[test]
+    fn intercept_notification_without_id_drops() {
+        for method in &["thread/start", "thread/list", "model/list", "turn/interrupt", "skills/list", "account/read"] {
+            let action = build_claude_intercept_action(
+                &json!({"method": method}),
+                "t1",
+                "w1",
+                None,
+            );
+            assert!(
+                matches!(action, InterceptAction::Drop),
+                "Expected Drop for notification {method} without id"
+            );
+        }
+    }
+
+    #[test]
+    fn intercept_turn_start_empty_input_no_id_drops() {
+        let action = build_claude_intercept_action(
+            &json!({
+                "method": "turn/start",
+                "params": { "input": [] }
+            }),
+            "t1",
+            "w1",
+            None,
+        );
+        assert!(matches!(action, InterceptAction::Drop));
+    }
+
+    #[test]
+    fn intercept_unknown_method_no_id_drops() {
+        let action = build_claude_intercept_action(
+            &json!({"method": "completely/unknown"}),
+            "t1",
+            "w1",
+            None,
+        );
+        assert!(matches!(action, InterceptAction::Drop));
+    }
+
+    #[test]
+    fn extract_user_text_multiple_text_items_joined() {
+        let params = json!({
+            "input": [
+                { "type": "text", "text": "Hello" },
+                { "type": "text", "text": "World" }
+            ]
+        });
+        assert_eq!(extract_user_text(&params), "Hello\nWorld");
+    }
+
+    #[test]
+    fn extract_user_text_prefers_input_over_text() {
+        let params = json!({
+            "input": [{ "type": "text", "text": "from input" }],
+            "text": "from text field"
+        });
+        assert_eq!(extract_user_text(&params), "from input");
+    }
+
+    #[test]
+    fn format_model_display_name_single_segment() {
+        assert_eq!(format_model_display_name("claude"), "Claude");
+    }
+
+    #[test]
+    fn format_model_display_name_with_non_date_suffix() {
+        assert_eq!(
+            format_model_display_name("claude-sonnet-4-beta"),
+            "Claude Sonnet 4 Beta"
+        );
+    }
+
+    #[test]
+    fn format_model_display_name_empty() {
+        assert_eq!(format_model_display_name(""), "");
+    }
+
+    #[test]
+    fn intercept_turn_start_with_text_field() {
+        let action = build_claude_intercept_action(
+            &json!({
+                "id": 70,
+                "method": "turn/start",
+                "params": { "text": "Simple text" }
+            }),
+            "t1",
+            "w1",
+            None,
+        );
+        match action {
+            InterceptAction::Forward(text) => assert_eq!(text, "Simple text"),
+            _ => panic!("Expected Forward"),
+        }
+    }
+
+    #[test]
+    fn intercept_initialize_without_id_drops() {
+        let action = build_claude_intercept_action(
+            &json!({"method": "initialize"}),
+            "t1",
+            "w1",
+            None,
+        );
+        assert!(matches!(action, InterceptAction::Drop));
+    }
 }

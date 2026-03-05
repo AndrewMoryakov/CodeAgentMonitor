@@ -1091,4 +1091,371 @@ mod tests {
         let msgs = map_event(&event, &mut state);
         assert_eq!(msgs[0]["params"]["usage"]["modelContextWindow"], 200_000);
     }
+
+    // ── Phase 5: Additional edge-case tests ───────────────────────
+
+    #[test]
+    fn assistant_text_subtype_produces_message_delta() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::Assistant(AssistantEvent {
+            subtype: Some("text".to_string()),
+            message: Some(serde_json::json!("Hello from assistant")),
+            content_block: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["method"], "item/agentMessage/delta");
+        assert_eq!(msgs[0]["params"]["delta"], "Hello from assistant");
+        assert_eq!(state.accumulated_text, "Hello from assistant");
+    }
+
+    #[test]
+    fn assistant_text_creates_item_if_none_exists() {
+        let mut state = make_state();
+        assert!(state.block_items.is_empty());
+
+        let event = ClaudeEvent::Assistant(AssistantEvent {
+            subtype: Some("text".to_string()),
+            message: Some(serde_json::json!("First message")),
+            content_block: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs.len(), 1);
+        // An item should have been auto-created
+        assert!(!state.block_items.is_empty());
+        assert_eq!(msgs[0]["params"]["itemId"], "item_1");
+    }
+
+    #[test]
+    fn assistant_text_reuses_existing_item() {
+        let mut state = make_state();
+        state.block_items.insert(0, "item_existing".to_string());
+
+        let event = ClaudeEvent::Assistant(AssistantEvent {
+            subtype: Some("text".to_string()),
+            message: Some(serde_json::json!("More text")),
+            content_block: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs[0]["params"]["itemId"], "item_existing");
+    }
+
+    #[test]
+    fn assistant_non_text_subtype_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::Assistant(AssistantEvent {
+            subtype: Some("other".to_string()),
+            message: Some(serde_json::json!("ignored")),
+            content_block: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn assistant_none_subtype_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::Assistant(AssistantEvent {
+            subtype: None,
+            message: Some(serde_json::json!("ignored")),
+            content_block: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_result_text_from_none() {
+        assert_eq!(extract_tool_result_text(None), "");
+    }
+
+    #[test]
+    fn extract_tool_result_text_from_string_value() {
+        let val = serde_json::json!("direct output");
+        assert_eq!(extract_tool_result_text(Some(&val)), "direct output");
+    }
+
+    #[test]
+    fn extract_tool_result_text_from_array() {
+        let val = serde_json::json!([
+            {"type": "text", "text": "line1"},
+            {"type": "text", "text": "line2"}
+        ]);
+        assert_eq!(extract_tool_result_text(Some(&val)), "line1\nline2");
+    }
+
+    #[test]
+    fn extract_tool_result_text_from_array_skips_non_text() {
+        let val = serde_json::json!([
+            {"type": "image", "url": "data:..."},
+            {"type": "text", "text": "only text"}
+        ]);
+        assert_eq!(extract_tool_result_text(Some(&val)), "only text");
+    }
+
+    #[test]
+    fn extract_tool_result_text_from_non_string_non_array() {
+        let val = serde_json::json!(42);
+        assert_eq!(extract_tool_result_text(Some(&val)), "");
+    }
+
+    #[test]
+    fn extract_tool_result_text_from_empty_array() {
+        let val = serde_json::json!([]);
+        assert_eq!(extract_tool_result_text(Some(&val)), "");
+    }
+
+    #[test]
+    fn context_window_defaults_to_200k() {
+        assert_eq!(context_window_for_model(None), 200_000);
+        assert_eq!(context_window_for_model(Some("unknown-model")), 200_000);
+    }
+
+    #[test]
+    fn context_window_for_known_models() {
+        assert_eq!(context_window_for_model(Some("claude-haiku-4")), 200_000);
+        assert_eq!(context_window_for_model(Some("claude-sonnet-4-20250514")), 200_000);
+        assert_eq!(context_window_for_model(Some("claude-opus-4-20250514")), 200_000);
+    }
+
+    #[test]
+    fn message_start_does_not_duplicate_turn_started() {
+        let mut state = make_state();
+        state.turn_started = true; // already started
+
+        let event = ClaudeEvent::MessageStart(MessageStartEvent {
+            message: Some(MessageInfo {
+                id: Some("msg_2".to_string()),
+                role: Some("assistant".to_string()),
+                model: None,
+                usage: None,
+            }),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty()); // no duplicate turn/started
+    }
+
+    #[test]
+    fn message_start_updates_model() {
+        let mut state = make_state();
+        assert!(state.model.is_none());
+
+        let event = ClaudeEvent::MessageStart(MessageStartEvent {
+            message: Some(MessageInfo {
+                id: None,
+                role: None,
+                model: Some("claude-opus-4-20250514".to_string()),
+                usage: None,
+            }),
+        });
+        map_event(&event, &mut state);
+        assert_eq!(state.model.as_deref(), Some("claude-opus-4-20250514"));
+    }
+
+    #[test]
+    fn message_stop_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::MessageStop(MessageStopEvent {
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn content_block_start_without_block_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::ContentBlockStart(ContentBlockEvent {
+            index: 0,
+            content_block: None,
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn content_block_delta_without_item_produces_nothing() {
+        let mut state = make_state();
+        // No block_items registered for index 5
+        let event = ClaudeEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 5,
+            delta: Some(ContentBlockDelta::TextDelta {
+                text: "orphan".to_string(),
+            }),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn content_block_delta_without_delta_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: None,
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn content_block_stop_without_registered_item_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::ContentBlockStop(ContentBlockStopEvent { index: 99 });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn result_without_turn_started_skips_turn_completed() {
+        let mut state = make_state();
+        assert!(!state.turn_started);
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: None,
+            usage: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        let has_turn_completed = msgs.iter().any(|m| m["method"] == "turn/completed");
+        assert!(!has_turn_completed);
+    }
+
+    #[test]
+    fn result_without_cost_skips_rate_limits() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: None,
+            usage: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        let has_rate_limits = msgs.iter().any(|m| m["method"] == "account/rateLimits/updated");
+        assert!(!has_rate_limits);
+    }
+
+    #[test]
+    fn result_without_text_skips_thread_name() {
+        let mut state = make_state();
+        state.turn_started = true;
+        assert!(state.accumulated_text.is_empty());
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: None,
+            usage: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        let has_name = msgs.iter().any(|m| m["method"] == "thread/name/updated");
+        assert!(!has_name);
+    }
+
+    #[test]
+    fn result_thread_name_truncated_to_38_chars() {
+        let mut state = make_state();
+        state.turn_started = true;
+        state.accumulated_text = "A".repeat(100);
+
+        let event = ClaudeEvent::Result(ResultEvent {
+            subtype: None, result: None, error: None,
+            duration_ms: None, duration_api_ms: None, num_turns: None,
+            is_error: false, session_id: None, cost_usd: None,
+            usage: None,
+            extra: Default::default(),
+        });
+        let msgs = map_event(&event, &mut state);
+        let name_msg = msgs.iter().find(|m| m["method"] == "thread/name/updated").unwrap();
+        let name = name_msg["params"]["name"].as_str().unwrap();
+        assert_eq!(name.len(), 38);
+    }
+
+    #[test]
+    fn multiple_content_blocks_tracked_independently() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        // Start text block at index 0
+        let start0 = ClaudeEvent::ContentBlockStart(ContentBlockEvent {
+            index: 0,
+            content_block: Some(ContentBlock::Text { text: String::new() }),
+        });
+        let msgs0 = map_event(&start0, &mut state);
+        let item_0 = msgs0[0]["params"]["item"]["id"].as_str().unwrap().to_string();
+
+        // Start thinking block at index 1
+        let start1 = ClaudeEvent::ContentBlockStart(ContentBlockEvent {
+            index: 1,
+            content_block: Some(ContentBlock::Thinking { thinking: String::new() }),
+        });
+        let msgs1 = map_event(&start1, &mut state);
+        let item_1 = msgs1[0]["params"]["item"]["id"].as_str().unwrap().to_string();
+
+        assert_ne!(item_0, item_1);
+
+        // Delta for index 0 → uses item_0
+        let delta0 = ClaudeEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: Some(ContentBlockDelta::TextDelta { text: "text".to_string() }),
+        });
+        let msgs = map_event(&delta0, &mut state);
+        assert_eq!(msgs[0]["params"]["itemId"], item_0);
+
+        // Delta for index 1 → uses item_1
+        let delta1 = ClaudeEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 1,
+            delta: Some(ContentBlockDelta::ThinkingDelta { thinking: "think".to_string() }),
+        });
+        let msgs = map_event(&delta1, &mut state);
+        assert_eq!(msgs[0]["params"]["itemId"], item_1);
+    }
+
+    #[test]
+    fn text_deltas_accumulate_in_state() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        // Start text block
+        let start = ClaudeEvent::ContentBlockStart(ContentBlockEvent {
+            index: 0,
+            content_block: Some(ContentBlock::Text { text: String::new() }),
+        });
+        map_event(&start, &mut state);
+
+        // Send multiple deltas
+        for word in &["Hello", " ", "world", "!"] {
+            let delta = ClaudeEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index: 0,
+                delta: Some(ContentBlockDelta::TextDelta { text: word.to_string() }),
+            });
+            map_event(&delta, &mut state);
+        }
+
+        assert_eq!(state.accumulated_text, "Hello world!");
+    }
+
+    #[test]
+    fn message_delta_without_usage_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::MessageDelta(MessageDeltaEvent {
+            delta: Some(serde_json::json!({"stop_reason": "end_turn"})),
+            usage: None,
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
 }
