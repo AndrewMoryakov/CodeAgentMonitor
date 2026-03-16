@@ -12,7 +12,7 @@ use crate::backend::events::{AppServerEvent, EventSink};
 use crate::types::WorkspaceEntry;
 
 use super::event_mapper;
-use super::history::{read_claude_sessions, read_session_items, ClaudeSession};
+use super::history::{discover_models, read_claude_sessions, read_session_items, ClaudeSession};
 use super::types::BridgeState;
 
 /// A prompt turn to be processed by the coordinator task.
@@ -271,6 +271,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                         &interceptor_thread_id,
                         &interceptor_workspace_id,
                         model.as_deref(),
+                        Some(&interceptor_workspace_path),
                     )
                 }
             }
@@ -573,6 +574,7 @@ fn build_claude_intercept_action(
     thread_id: &str,
     _workspace_id: &str,
     detected_model: Option<&str>,
+    workspace_path: Option<&str>,
 ) -> InterceptAction {
     let method = value
         .get("method")
@@ -668,22 +670,45 @@ fn build_claude_intercept_action(
 
         "model/list" => {
             if let Some(id) = id {
-                let model_id = detected_model.unwrap_or("claude-sonnet-4-20250514");
-                let display_name = format_model_display_name(model_id);
-                InterceptAction::Respond(json!({
-                    "id": id,
-                    "result": {
-                        "data": [{
+                let models = workspace_path
+                    .map(|p| discover_models(p))
+                    .unwrap_or_default();
+                let detected = detected_model.unwrap_or("");
+                let data: Vec<Value> = if models.is_empty() {
+                    let fallback_id = if detected.is_empty() { "claude-sonnet-4-6" } else { detected };
+                    let display = format_model_display_name(fallback_id);
+                    vec![json!({
+                        "id": fallback_id,
+                        "model": fallback_id,
+                        "displayName": display,
+                        "name": display,
+                        "isDefault": true,
+                        "supportedReasoningEfforts": [],
+                        "defaultReasoningEffort": null,
+                        "description": "Claude CLI"
+                    })]
+                } else {
+                    models.iter().enumerate().map(|(i, (model_id, display_name))| {
+                        let is_default = if !detected.is_empty() {
+                            model_id == detected
+                        } else {
+                            i == 0
+                        };
+                        json!({
                             "id": model_id,
                             "model": model_id,
                             "displayName": display_name,
                             "name": display_name,
-                            "isDefault": true,
+                            "isDefault": is_default,
                             "supportedReasoningEfforts": [],
                             "defaultReasoningEffort": null,
                             "description": "Claude CLI"
-                        }]
-                    }
+                        })
+                    }).collect()
+                };
+                InterceptAction::Respond(json!({
+                    "id": id,
+                    "result": { "data": data }
                 }))
             } else {
                 InterceptAction::Drop
@@ -796,7 +821,7 @@ mod tests {
     #[test]
     fn intercept_initialize_responds_immediately() {
         let action =
-            build_claude_intercept_action(&json!({"id": 1, "method": "initialize"}), "t1", "w1", None);
+            build_claude_intercept_action(&json!({"id": 1, "method": "initialize"}), "t1", "w1", None, None);
         match action {
             InterceptAction::Respond(v) => {
                 assert_eq!(v["id"], 1);
@@ -868,7 +893,7 @@ mod tests {
     #[test]
     fn intercept_notification_drops_initialized() {
         let action =
-            build_claude_intercept_action(&json!({"method": "initialized"}), "t1", "w1", None);
+            build_claude_intercept_action(&json!({"method": "initialized"}), "t1", "w1", None, None);
         assert!(matches!(action, InterceptAction::Drop));
     }
 

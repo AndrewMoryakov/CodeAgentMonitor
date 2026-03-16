@@ -277,6 +277,129 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
     items
 }
 
+/// Scan all JSONL session files under `~/.claude/projects/` to discover
+/// model IDs actually used. Returns `Vec<(model_id, display_name)>`
+/// deduplicated, most-recently-used first. No hardcoded model list.
+pub(crate) fn discover_models(workspace_path: &str) -> Vec<(String, String)> {
+    let root = match claude_projects_root() {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    // Scan ALL projects so we find every model the user has access to,
+    // not just ones used in the current workspace.
+    let project_dirs: Vec<_> = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // Also include the current workspace directly in case it's not listed.
+    let encoded = encode_workspace_path(workspace_path);
+    let current_project = root.join(&encoded);
+
+    let mut all_dirs = project_dirs;
+    if current_project.is_dir() && !all_dirs.iter().any(|d| d == &current_project) {
+        all_dirs.insert(0, current_project);
+    }
+
+    let mut seen_order: Vec<String> = Vec::new();
+    let mut seen_set = std::collections::HashSet::new();
+
+    for project_dir in &all_dirs {
+        let entries = match std::fs::read_dir(project_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    let mtime = e.metadata().and_then(|m| m.modified()).ok();
+                    Some((p, mtime))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Newest first.
+        paths.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Sample first few lines of each file (model appears early in the conversation).
+        for (path, _) in paths.iter().take(10) {
+            use std::io::BufRead;
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for line in std::io::BufReader::new(file).lines().take(20) {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let obj: Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(model) = obj
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                {
+                    let model = model.trim();
+                    if !model.is_empty()
+                        && !model.starts_with('<')
+                        && seen_set.insert(model.to_string())
+                    {
+                        seen_order.push(model.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    seen_order
+        .into_iter()
+        .map(|id| {
+            let display = id.clone();
+            (id, display)
+        })
+        .collect()
+}
+
+/// Format a model ID into a human-readable name.
+/// `claude-opus-4-6` → `Claude Opus 4 6`, strips date suffixes like `-20251001`.
+fn format_model_name(id: &str) -> String {
+    let base = if let Some(pos) = id.rfind('-') {
+        let suffix = &id[pos + 1..];
+        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+            &id[..pos]
+        } else {
+            id
+        }
+    } else {
+        id
+    };
+    base.split('-')
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                None => String::new(),
+                Some(first) => {
+                    let upper: String = first.to_uppercase().collect();
+                    upper + c.as_str()
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::encode_workspace_path;
