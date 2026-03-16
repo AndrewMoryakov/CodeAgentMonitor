@@ -212,6 +212,7 @@ export const Sidebar = memo(function Sidebar({
   const { getThreadRows } = useThreadRows(threadParentById);
   const { showThreadMenu, showWorkspaceMenu, showWorktreeMenu, showCloneMenu } =
     useSidebarMenus({
+      backendMode,
       onDeleteThread,
       onSyncThread,
       onPinThread: pinThread,
@@ -296,7 +297,10 @@ export const Sidebar = memo(function Sidebar({
       : "Sign in to Codex";
   const accountActionLabel = accountEmail ? "Switch account" : "Sign in";
   const showAccountSwitcher = Boolean(activeWorkspaceId);
-  const accountSwitchDisabled = accountSwitching || !activeWorkspaceId;
+  const accountDisabledReason =
+    backendMode === "claude" ? "Пока не поддерживается" : null;
+  const accountSwitchDisabled =
+    backendMode === "claude" || accountSwitching || !activeWorkspaceId;
   const accountCancelDisabled = !accountSwitching || !activeWorkspaceId;
   const refreshDisabled = workspaces.length === 0 || workspaces.every((workspace) => !workspace.connected);
   const refreshInProgress = workspaces.some(
@@ -1204,6 +1208,7 @@ export const Sidebar = memo(function Sidebar({
         accountLabel={accountButtonLabel}
         accountActionLabel={accountActionLabel}
         accountDisabled={accountSwitchDisabled}
+        accountDisabledReason={accountDisabledReason}
         accountSwitching={accountSwitching}
         accountCancelDisabled={accountCancelDisabled}
         onSwitchAccount={onSwitchAccount}

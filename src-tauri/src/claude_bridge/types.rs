@@ -223,6 +223,8 @@ pub(crate) struct BridgeState {
     pub(crate) next_item_id: u64,
     /// Maps content block index to the item ID assigned for that block.
     pub(crate) block_items: std::collections::HashMap<u64, String>,
+    /// Maps content block index to the evolving item payload for non-tool blocks.
+    pub(crate) block_item_payloads: std::collections::HashMap<u64, Value>,
     /// Accumulated text from assistant text blocks (for thread naming).
     pub(crate) accumulated_text: String,
     /// Whether `thread/started` has been emitted.
@@ -244,14 +246,14 @@ pub(crate) struct BridgeState {
 }
 
 impl BridgeState {
-    pub(crate) fn new(workspace_id: String, thread_id: String) -> Self {
-        let turn_id = format!("turn_{}", uuid::Uuid::new_v4());
+    pub(crate) fn new(workspace_id: String, thread_id: String, turn_id: String) -> Self {
         Self {
             thread_id,
             turn_id,
             workspace_id,
             next_item_id: 1,
             block_items: std::collections::HashMap::new(),
+            block_item_payloads: std::collections::HashMap::new(),
             accumulated_text: String::new(),
             thread_started: false,
             turn_started: false,
@@ -274,6 +276,7 @@ impl BridgeState {
         self.turn_id = format!("turn_{}", uuid::Uuid::new_v4());
         self.turn_started = false;
         self.block_items.clear();
+        self.block_item_payloads.clear();
         self.tool_items.clear();
         self.block_tool_use_ids.clear();
     }

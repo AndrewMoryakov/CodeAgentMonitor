@@ -102,6 +102,15 @@ fn map_content_block_start(
         ContentBlock::Text { .. } => {
             let item_id = state.next_item();
             state.block_items.insert(cb.index, item_id.clone());
+            state.block_item_payloads.insert(
+                cb.index,
+                json!({
+                    "id": item_id,
+                    "type": "agentMessage",
+                    "status": "in_progress",
+                    "text": "",
+                }),
+            );
             out.push(json!({
                 "method": "item/started",
                 "params": {
@@ -118,6 +127,16 @@ fn map_content_block_start(
         ContentBlock::Thinking { .. } => {
             let item_id = state.next_item();
             state.block_items.insert(cb.index, item_id.clone());
+            state.block_item_payloads.insert(
+                cb.index,
+                json!({
+                    "id": item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": "",
+                    "content": "",
+                }),
+            );
             out.push(json!({
                 "method": "item/started",
                 "params": {
@@ -224,6 +243,14 @@ fn map_content_block_delta(
     match delta {
         ContentBlockDelta::TextDelta { text } => {
             state.accumulated_text.push_str(text);
+            if let Some(item) = state.block_item_payloads.get_mut(&cbd.index) {
+                let current = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                item["text"] = json!(format!("{current}{text}"));
+            }
             out.push(json!({
                 "method": "item/agentMessage/delta",
                 "params": {
@@ -235,6 +262,14 @@ fn map_content_block_delta(
             }));
         }
         ContentBlockDelta::ThinkingDelta { thinking } => {
+            if let Some(item) = state.block_item_payloads.get_mut(&cbd.index) {
+                let current = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                item["content"] = json!(format!("{current}{thinking}"));
+            }
             out.push(json!({
                 "method": "item/reasoning/textDelta",
                 "params": {
@@ -296,13 +331,27 @@ fn map_content_block_stop(
 
     // Non-tool block: emit simple item/completed
     if let Some(item_id) = state.block_items.get(&cbs.index) {
+        let item = state
+            .block_item_payloads
+            .get(&cbs.index)
+            .cloned()
+            .map(|mut payload| {
+                payload["status"] = json!("completed");
+                payload
+            })
+            .unwrap_or_else(|| {
+                json!({
+                    "id": item_id,
+                    "status": "completed",
+                })
+            });
         out.push(json!({
             "method": "item/completed",
             "params": {
                 "threadId": state.thread_id,
                 "turnId": state.turn_id,
                 "itemId": item_id,
-                "status": "completed"
+                "item": item
             }
         }));
     }
@@ -330,7 +379,7 @@ fn map_message_delta(
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": state.thread_id,
-                "usage": {
+                "tokenUsage": {
                     "inputTokens": usage.input_tokens,
                     "outputTokens": usage.output_tokens,
                     "cacheCreationInputTokens": usage.cache_creation_input_tokens,
@@ -369,7 +418,7 @@ fn map_result(
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": state.thread_id,
-                "usage": {
+                "tokenUsage": {
                     "last": {
                         "inputTokens": usage.input_tokens,
                         "outputTokens": usage.output_tokens,
@@ -397,6 +446,19 @@ fn map_result(
 
     // Emit turn/completed with cost and duration
     if state.turn_started {
+        if res.is_error {
+            out.push(json!({
+                "method": "error",
+                "params": {
+                    "threadId": state.thread_id,
+                    "turnId": state.turn_id,
+                    "willRetry": false,
+                    "error": {
+                        "message": res.error.clone().unwrap_or_else(|| "Claude turn failed.".to_string())
+                    }
+                }
+            }));
+        }
         out.push(json!({
             "method": "turn/completed",
             "params": {
@@ -414,14 +476,16 @@ fn map_result(
         out.push(json!({
             "method": "account/rateLimits/updated",
             "params": {
-                "primary": null,
-                "secondary": null,
-                "credits": {
-                    "hasCredits": true,
-                    "unlimited": false,
-                    "balance": format!("${:.2} spent", state.total_cost_usd)
-                },
-                "planType": "claude-cli"
+                "rateLimits": {
+                    "primary": null,
+                    "secondary": null,
+                    "credits": {
+                        "hasCredits": true,
+                        "unlimited": false,
+                        "balance": format!("${:.2} spent", state.total_cost_usd)
+                    },
+                    "planType": "claude-cli"
+                }
             }
         }));
     }
@@ -435,7 +499,7 @@ fn map_result(
                 "method": "thread/name/updated",
                 "params": {
                     "threadId": state.thread_id,
-                    "name": name
+                    "threadName": name
                 }
             }));
         }

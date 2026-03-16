@@ -7,6 +7,7 @@ import type {
   TcpDaemonStatus,
 } from "@/types";
 import {
+  checkClaudeInstallation,
   listWorkspaces,
   tailscaleDaemonCommandPreview as fetchTailscaleDaemonCommandPreview,
   tailscaleDaemonStart,
@@ -71,6 +72,10 @@ export type SettingsServerSectionProps = {
   onTcpDaemonStop: () => Promise<void>;
   onTcpDaemonStatus: () => Promise<void>;
   onMobileConnectTest: () => void;
+  claudeCheckStatus: string | null;
+  claudeCheckBusy: boolean;
+  claudeCheckError: boolean;
+  onCheckClaudeInstallation: () => void;
 };
 
 const formatErrorMessage = (error: unknown, fallback: string) => {
@@ -169,6 +174,9 @@ export const useSettingsServerSection = ({
   const [mobileConnectBusy, setMobileConnectBusy] = useState(false);
   const [mobileConnectStatusText, setMobileConnectStatusText] = useState<string | null>(null);
   const [mobileConnectStatusError, setMobileConnectStatusError] = useState(false);
+  const [claudeCheckStatus, setClaudeCheckStatus] = useState<string | null>(null);
+  const [claudeCheckBusy, setClaudeCheckBusy] = useState(false);
+  const [claudeCheckError, setClaudeCheckError] = useState(false);
   const mobilePlatform = useMemo(() => isMobilePlatform(), []);
 
   const latestSettingsRef = useRef(appSettings);
@@ -622,6 +630,30 @@ export const useSettingsServerSection = ({
     await runTcpDaemonAction("status", tailscaleDaemonStatus);
   }, [runTcpDaemonAction]);
 
+  const handleCheckClaudeInstallation = useCallback(() => {
+    void (async () => {
+      setClaudeCheckBusy(true);
+      setClaudeCheckStatus(null);
+      setClaudeCheckError(false);
+      try {
+        const version = await checkClaudeInstallation();
+        setClaudeCheckStatus(`Found: ${version}`);
+        setClaudeCheckError(false);
+      } catch (error) {
+        setClaudeCheckStatus(formatErrorMessage(error, "Claude CLI not found."));
+        setClaudeCheckError(true);
+      } finally {
+        setClaudeCheckBusy(false);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (appSettings.backendMode === "claude") {
+      handleCheckClaudeInstallation();
+    }
+  }, [appSettings.backendMode, handleCheckClaudeInstallation]);
+
   useEffect(() => {
     if (!mobilePlatform) {
       handleRefreshTailscaleCommandPreview();
@@ -684,5 +716,9 @@ export const useSettingsServerSection = ({
     mobileConnectStatusText,
     mobileConnectStatusError,
     onMobileConnectTest: handleMobileConnectTest,
+    claudeCheckStatus,
+    claudeCheckBusy,
+    claudeCheckError,
+    onCheckClaudeInstallation: handleCheckClaudeInstallation,
   };
 };

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import * as Sentry from "@sentry/react";
 import type {
+  BackendMode,
   CustomPromptOption,
   DebugEntry,
   ThreadListSortKey,
@@ -38,6 +39,7 @@ type UseThreadsOptions = {
   activeWorkspace: WorkspaceInfo | null;
   onWorkspaceConnected: (id: string) => void;
   onDebug?: (entry: DebugEntry) => void;
+  backendMode?: BackendMode;
   ensureWorkspaceRuntimeCodexArgs?: (
     workspaceId: string,
     threadId: string | null,
@@ -70,6 +72,7 @@ export function useThreads({
   activeWorkspace,
   onWorkspaceConnected,
   onDebug,
+  backendMode = "local",
   ensureWorkspaceRuntimeCodexArgs,
   model,
   effort,
@@ -194,6 +197,16 @@ export function useThreads({
 
   const renameThread = useCallback(
     (workspaceId: string, threadId: string, newName: string) => {
+      if (backendMode === "claude") {
+        onDebug?.({
+          id: `${Date.now()}-client-thread-rename-unsupported`,
+          timestamp: Date.now(),
+          source: "client",
+          label: "thread/name/set unsupported",
+          payload: { workspaceId, threadId, newName },
+        });
+        return;
+      }
       saveCustomName(workspaceId, threadId, newName);
       const key = makeCustomNameKey(workspaceId, threadId);
       customNamesRef.current[key] = newName;
@@ -210,7 +223,7 @@ export function useThreads({
         });
       });
     },
-    [customNamesRef, dispatch, onDebug],
+    [backendMode, customNamesRef, dispatch, onDebug],
   );
 
   const onSubagentThreadDetected = useCallback(
@@ -740,6 +753,7 @@ export function useThreads({
   } = useThreadMessaging({
     activeWorkspace,
     activeThreadId,
+    backendMode,
     accessMode,
     model,
     effort,

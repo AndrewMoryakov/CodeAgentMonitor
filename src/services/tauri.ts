@@ -876,6 +876,10 @@ export async function tailscaleDaemonStatus(): Promise<TcpDaemonStatus> {
   return invoke<TcpDaemonStatus>("tailscale_daemon_status");
 }
 
+export async function checkClaudeInstallation(): Promise<string> {
+  return invoke<string>("check_claude_installation");
+}
+
 type MenuAcceleratorUpdate = {
   id: string;
   accelerator: string | null;

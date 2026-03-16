@@ -129,20 +129,22 @@ pub(crate) fn build_item_completed(
     let parsed_input: Value = serde_json::from_str(&info.accumulated_input_json)
         .unwrap_or(Value::Null);
 
-    let mut params = json!({
-        "threadId": thread_id,
-        "turnId": turn_id,
-        "itemId": info.item_id,
+    let mut item = json!({
+        "id": info.item_id,
+        "type": info.category.item_type(),
         "status": "completed",
+        "toolName": info.tool_name,
+        "toolUseId": info.tool_use_id,
     });
 
     match info.category {
         ToolCategory::CommandExecution | ToolCategory::FileRead | ToolCategory::Other => {
             if let Some(cmd) = extract_command(&info.tool_name, &parsed_input) {
-                params["command"] = json!(cmd);
+                item["command"] = json!(cmd);
             }
+            item["cwd"] = json!("");
             if !info.aggregated_output.is_empty() {
-                params["aggregatedOutput"] = json!(info.aggregated_output);
+                item["aggregatedOutput"] = json!(info.aggregated_output);
             }
         }
         ToolCategory::FileChange => {
@@ -157,13 +159,18 @@ pub(crate) fn build_item_completed(
             if !info.aggregated_output.is_empty() {
                 change["diff"] = json!(info.aggregated_output);
             }
-            params["changes"] = json!([change]);
+            item["changes"] = json!([change]);
         }
     }
 
     json!({
         "method": "item/completed",
-        "params": params,
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "itemId": info.item_id,
+            "item": item,
+        },
     })
 }
 

@@ -423,6 +423,7 @@ function MainApp() {
     preferredModelId,
     preferredEffort,
     selectionKey: threadCodexSelectionKey,
+    backendMode: appSettings.backendMode,
   });
 
   const {
@@ -675,6 +676,7 @@ function MainApp() {
     activeWorkspace,
     onWorkspaceConnected: markWorkspaceConnected,
     onDebug: addDebugEntry,
+    backendMode: appSettings.backendMode,
     model: resolvedModel,
     effort: resolvedEffort,
     collaborationMode: collaborationModePayload,
@@ -1749,7 +1751,43 @@ function MainApp() {
     hasLoaded,
     connectWorkspace,
     listThreadsForWorkspaces,
+    backendMode: appSettings.backendMode,
   });
+
+  // When backend mode changes (e.g. local → claude), reconnect all workspaces
+  // so sessions are re-created with the correct backend, then reload threads.
+  const prevBackendModeRef = useRef(appSettings.backendMode);
+  useEffect(() => {
+    const prevMode = prevBackendModeRef.current;
+    prevBackendModeRef.current = appSettings.backendMode;
+    if (prevMode === appSettings.backendMode) {
+      return;
+    }
+    void (async () => {
+      const targets: typeof workspaces = [];
+      for (const workspace of workspaces) {
+        // Clear active thread so old threads don't persist as anchors.
+        setActiveThreadId(null, workspace.id);
+        resetWorkspaceThreads(workspace.id);
+        try {
+          await connectWorkspace(workspace);
+          targets.push({ ...workspace, connected: true });
+        } catch {
+          // Connection errors show in debug panel.
+        }
+      }
+      if (targets.length > 0) {
+        if (appSettings.backendMode === "claude") {
+          for (const ws of targets) {
+            await listThreadsForWorkspaces([ws]);
+          }
+        } else {
+          await listThreadsForWorkspaces(targets);
+        }
+      }
+    })();
+  }, [appSettings.backendMode, workspaces, connectWorkspace, setActiveThreadId, resetWorkspaceThreads, listThreadsForWorkspaces]);
+
   useWorkspaceRefreshOnFocus({
     workspaces,
     refreshWorkspaces,

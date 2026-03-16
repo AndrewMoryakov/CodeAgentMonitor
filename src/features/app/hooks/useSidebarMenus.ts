@@ -3,11 +3,12 @@ import { Menu, MenuItem } from "@tauri-apps/api/menu";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import type { WorkspaceInfo } from "../../../types";
+import type { BackendMode, WorkspaceInfo } from "../../../types";
 import { pushErrorToast } from "../../../services/toasts";
 import { fileManagerName } from "../../../utils/platformPaths";
 
 type SidebarMenuHandlers = {
+  backendMode?: BackendMode;
   onDeleteThread: (workspaceId: string, threadId: string) => void;
   onSyncThread: (workspaceId: string, threadId: string) => void;
   onPinThread: (workspaceId: string, threadId: string) => void;
@@ -20,6 +21,7 @@ type SidebarMenuHandlers = {
 };
 
 export function useSidebarMenus({
+  backendMode = "local",
   onDeleteThread,
   onSyncThread,
   onPinThread,
@@ -61,7 +63,8 @@ export function useSidebarMenus({
           }
         },
       });
-      const items = [renameItem, syncItem];
+      const supportsClaudeThreadMutations = backendMode !== "claude";
+      const items = supportsClaudeThreadMutations ? [renameItem, syncItem] : [syncItem];
       if (canPin) {
         const isPinned = isThreadPinned(workspaceId, threadId);
         items.push(
@@ -77,13 +80,17 @@ export function useSidebarMenus({
           }),
         );
       }
-      items.push(copyItem, archiveItem);
+      items.push(copyItem);
+      if (supportsClaudeThreadMutations) {
+        items.push(archiveItem);
+      }
       const menu = await Menu.new({ items });
       const window = getCurrentWindow();
       const position = new LogicalPosition(event.clientX, event.clientY);
       await menu.popup(position, window);
     },
     [
+      backendMode,
       isThreadPinned,
       onDeleteThread,
       onPinThread,

@@ -17,6 +17,7 @@ type SidebarCornerActionsProps = {
   accountLabel: string;
   accountActionLabel: string;
   accountDisabled: boolean;
+  accountDisabledReason?: string | null;
   accountSwitching: boolean;
   accountCancelDisabled: boolean;
   onSwitchAccount: () => void;
@@ -31,6 +32,7 @@ export function SidebarCornerActions({
   accountLabel,
   accountActionLabel,
   accountDisabled,
+  accountDisabledReason = null,
   accountSwitching,
   accountCancelDisabled,
   onSwitchAccount,
@@ -77,6 +79,7 @@ export function SidebarCornerActions({
                   onClick={onSwitchAccount}
                   disabled={accountDisabled}
                   aria-busy={accountSwitching}
+                  title={accountDisabledReason ?? undefined}
                 >
                   <span className="sidebar-account-action-content">
                     {accountSwitching && (

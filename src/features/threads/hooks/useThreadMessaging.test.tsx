@@ -14,6 +14,8 @@ import {
 import type { WorkspaceInfo } from "@/types";
 import { useThreadMessaging } from "./useThreadMessaging";
 
+const openReviewPromptMock = vi.fn();
+
 vi.mock("@sentry/react", () => ({
   metrics: {
     count: vi.fn(),
@@ -33,7 +35,7 @@ vi.mock("@services/tauri", () => ({
 vi.mock("./useReviewPrompt", () => ({
   useReviewPrompt: () => ({
     reviewPrompt: null,
-    openReviewPrompt: vi.fn(),
+    openReviewPrompt: openReviewPromptMock,
     closeReviewPrompt: vi.fn(),
     showPresetStep: vi.fn(),
     choosePreset: vi.fn(),
@@ -590,5 +592,145 @@ describe("useThreadMessaging telemetry", () => {
       "thread-review-1",
       "Review abcdef1: Tighten sidebar commit…",
     );
+  });
+
+  it("does not open the review prompt in claude mode", async () => {
+    const pushThreadErrorMessage = vi.fn();
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        backendMode: "claude",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage,
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startReview("/review");
+    });
+
+    expect(openReviewPromptMock).not.toHaveBeenCalled();
+    expect(startReviewService).not.toHaveBeenCalled();
+    expect(pushThreadErrorMessage).toHaveBeenCalledWith(
+      "thread-1",
+      "Пока не поддерживается",
+    );
+  });
+
+  it("does not create a new thread for claude review failure", async () => {
+    const ensureThreadForActiveWorkspace = vi.fn(async () => "thread-1");
+    const pushThreadErrorMessage = vi.fn();
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: null,
+        backendMode: "claude",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage,
+        ensureThreadForActiveWorkspace,
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startReview("/review commit abcdef1 Check this");
+    });
+
+    expect(ensureThreadForActiveWorkspace).not.toHaveBeenCalled();
+    expect(startReviewService).not.toHaveBeenCalled();
+    expect(pushThreadErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not call fork or compact services in claude mode", async () => {
+    const pushThreadErrorMessage = vi.fn();
+    const forkThreadForWorkspace = vi.fn(async () => "thread-2");
+    const ensureThreadForActiveWorkspace = vi.fn(async () => "thread-1");
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        backendMode: "claude",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage,
+        ensureThreadForActiveWorkspace,
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace,
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startFork("/fork branch");
+      await result.current.startCompact("/compact");
+    });
+
+    expect(forkThreadForWorkspace).not.toHaveBeenCalled();
+    expect(compactThreadService).not.toHaveBeenCalled();
+    expect(ensureThreadForActiveWorkspace).not.toHaveBeenCalled();
+    expect(pushThreadErrorMessage).toHaveBeenCalledTimes(2);
   });
 });

@@ -4,6 +4,7 @@ import * as Sentry from "@sentry/react";
 import type {
   AccessMode,
   AppMention,
+  BackendMode,
   ComposerSendIntent,
   SendMessageResult,
   RateLimitSnapshot,
@@ -46,6 +47,7 @@ type SendMessageOptions = {
 type UseThreadMessagingOptions = {
   activeWorkspace: WorkspaceInfo | null;
   activeThreadId: string | null;
+  backendMode?: BackendMode;
   accessMode?: "read-only" | "current" | "full-access";
   model?: string | null;
   effort?: string | null;
@@ -130,6 +132,7 @@ function isStaleSteerTurnError(message: string): boolean {
 export function useThreadMessaging({
   activeWorkspace,
   activeThreadId,
+  backendMode = "local",
   accessMode,
   model,
   effort,
@@ -160,6 +163,24 @@ export function useThreadMessaging({
   registerDetachedReviewChild,
   renameThread,
 }: UseThreadMessagingOptions) {
+  const unsupportedClaudeMessage = "Пока не поддерживается";
+  const reportUnsupportedClaudeAction = useCallback(
+    (threadId?: string | null) => {
+      if (!threadId) {
+        onDebug?.({
+          id: `${Date.now()}-client-claude-unsupported`,
+          timestamp: Date.now(),
+          source: "client",
+          label: "claude unsupported action",
+          payload: unsupportedClaudeMessage,
+        });
+        return;
+      }
+      pushThreadErrorMessage(threadId, unsupportedClaudeMessage);
+      safeMessageActivity();
+    },
+    [onDebug, pushThreadErrorMessage, safeMessageActivity, unsupportedClaudeMessage],
+  );
   const sendMessageToThread = useCallback(
     async (
       workspace: WorkspaceInfo,
@@ -534,6 +555,16 @@ export function useThreadMessaging({
 
   const startReviewTarget = useCallback(
     async (target: ReviewTarget, workspaceIdOverride?: string): Promise<boolean> => {
+      if (backendMode === "claude") {
+        const canReportInActiveThread =
+          !workspaceIdOverride &&
+          Boolean(activeThreadId) &&
+          activeWorkspace;
+        reportUnsupportedClaudeAction(
+          canReportInActiveThread ? activeThreadId : null,
+        );
+        return false;
+      }
       const workspaceId = workspaceIdOverride ?? activeWorkspace?.id ?? null;
       if (!workspaceId) {
         return false;
@@ -620,7 +651,9 @@ export function useThreadMessaging({
       }
     },
     [
+      activeThreadId,
       activeWorkspace,
+      backendMode,
       ensureThreadForActiveWorkspace,
       ensureThreadForWorkspace,
       getCustomName,
@@ -631,8 +664,10 @@ export function useThreadMessaging({
       safeMessageActivity,
       setActiveTurnId,
       reviewDeliveryMode,
+      reportUnsupportedClaudeAction,
       registerDetachedReviewChild,
       renameThread,
+      unsupportedClaudeMessage,
       updateThreadParent,
     ],
   );
@@ -670,6 +705,10 @@ export function useThreadMessaging({
       if (!activeWorkspace || !text.trim()) {
         return;
       }
+      if (backendMode === "claude") {
+        reportUnsupportedClaudeAction(activeThreadId);
+        return;
+      }
       const trimmed = text.trim();
       const rest = trimmed.replace(/^\/review\b/i, "").trim();
       if (!rest) {
@@ -681,8 +720,11 @@ export function useThreadMessaging({
       await startReviewTarget(target);
     },
     [
+      activeThreadId,
       activeWorkspace,
+      backendMode,
       openReviewPrompt,
+      reportUnsupportedClaudeAction,
       startReviewTarget,
     ],
   );
@@ -983,6 +1025,10 @@ export function useThreadMessaging({
       if (!activeWorkspace || !activeThreadId) {
         return;
       }
+      if (backendMode === "claude") {
+        reportUnsupportedClaudeAction(activeThreadId);
+        return;
+      }
       const trimmed = text.trim();
       const rest = trimmed.replace(/^\/fork\b/i, "").trim();
       const threadId = await forkThreadForWorkspace(activeWorkspace.id, activeThreadId);
@@ -997,7 +1043,9 @@ export function useThreadMessaging({
     [
       activeThreadId,
       activeWorkspace,
+      backendMode,
       forkThreadForWorkspace,
+      reportUnsupportedClaudeAction,
       sendMessageToThread,
       updateThreadParent,
     ],
@@ -1033,6 +1081,10 @@ export function useThreadMessaging({
       if (!activeWorkspace) {
         return;
       }
+      if (backendMode === "claude") {
+        reportUnsupportedClaudeAction(activeThreadId);
+        return;
+      }
       const threadId = activeThreadId ?? (await ensureThreadForActiveWorkspace());
       if (!threadId) {
         return;
@@ -1053,9 +1105,12 @@ export function useThreadMessaging({
     [
       activeThreadId,
       activeWorkspace,
+      backendMode,
       ensureThreadForActiveWorkspace,
       pushThreadErrorMessage,
+      reportUnsupportedClaudeAction,
       safeMessageActivity,
+      unsupportedClaudeMessage,
     ],
   );
 

@@ -295,7 +295,8 @@ pub fn run() {
             tailscale::tailscale_daemon_start,
             tailscale::tailscale_daemon_stop,
             tailscale::tailscale_daemon_status,
-            is_mobile_runtime
+            is_mobile_runtime,
+            claude_bridge::process::check_claude_installation
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

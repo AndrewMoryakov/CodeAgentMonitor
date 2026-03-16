@@ -26,8 +26,18 @@ pub(crate) async fn update_app_settings(
     let previous = state.app_settings.lock().await.clone();
     let updated =
         update_app_settings_core(settings, &state.app_settings, &state.settings_path).await?;
+    let backend_mode_changed = previous.backend_mode != updated.backend_mode;
     if should_reset_remote_backend(&previous, &updated) {
         *state.remote_backend.lock().await = None;
+    }
+    if backend_mode_changed {
+        // Kill all existing workspace sessions so they are re-created
+        // with the correct backend (Codex vs Claude CLI) on next connect.
+        let mut sessions = state.sessions.lock().await;
+        for (_id, session) in sessions.drain() {
+            let mut child = session.child.lock().await;
+            crate::shared::process_core::kill_child_process_tree(&mut child).await;
+        }
     }
     ensure_remote_runtime_for_settings(&updated, state).await;
     let _ = window::apply_window_appearance(&window, updated.theme.as_str());
@@ -48,6 +58,9 @@ fn should_reset_remote_backend(previous: &AppSettings, updated: &AppSettings) ->
         ) | (
             crate::types::BackendMode::Remote,
             crate::types::BackendMode::Remote
+        ) | (
+            crate::types::BackendMode::Claude,
+            crate::types::BackendMode::Claude
         )
     );
     backend_mode_changed
@@ -96,5 +109,22 @@ mod tests {
         updated.theme = "dark".to_string();
         updated.backend_mode = BackendMode::Local;
         assert!(!should_reset_remote_backend(&previous, &updated));
+    }
+
+    #[test]
+    fn should_not_reset_remote_backend_when_staying_in_claude_mode() {
+        let mut previous = AppSettings::default();
+        previous.backend_mode = BackendMode::Claude;
+        let mut updated = previous.clone();
+        updated.theme = "dark".to_string();
+        assert!(!should_reset_remote_backend(&previous, &updated));
+    }
+
+    #[test]
+    fn should_reset_remote_backend_when_switching_to_claude_mode() {
+        let previous = AppSettings::default(); // Local
+        let mut updated = previous.clone();
+        updated.backend_mode = BackendMode::Claude;
+        assert!(should_reset_remote_backend(&previous, &updated));
     }
 }

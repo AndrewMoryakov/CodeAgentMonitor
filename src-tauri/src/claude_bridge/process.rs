@@ -12,9 +12,29 @@ use crate::backend::events::{AppServerEvent, EventSink};
 use crate::types::WorkspaceEntry;
 
 use super::event_mapper;
+use super::history::{read_claude_sessions, read_session_items, ClaudeSession};
 use super::types::BridgeState;
 
+/// A prompt turn to be processed by the coordinator task.
+struct TurnRequest {
+    prompt: String,
+    /// The thread ID from `turn/start` params (may be a historical session UUID).
+    thread_id: String,
+    turn_id: String,
+}
+
+/// How to identify the conversation session when spawning `claude --print`.
+enum SessionArg {
+    /// First turn of a brand-new conversation — no session flags.
+    New,
+    /// Continue the most-recent session in the working directory.
+    Continue,
+    /// Resume a specific session by UUID.
+    Resume(String),
+}
+
 /// Check that the `claude` CLI binary is available.
+#[tauri::command]
 pub(crate) async fn check_claude_installation() -> Result<String, String> {
     let result = Command::new("claude")
         .arg("--version")
@@ -33,6 +53,12 @@ pub(crate) async fn check_claude_installation() -> Result<String, String> {
 /// Spawn a Claude CLI session that presents the same `WorkspaceSession`
 /// interface as the Codex backend. The bridge translates between the
 /// Codex JSON-RPC protocol and Claude CLI's stream-json format.
+///
+/// Architecture: **spawn-per-turn**. Each `turn/start` / `turn/steer` message
+/// spawns a fresh `claude --print --output-format stream-json` process.
+/// Historical sessions are loaded from `~/.claude/projects/<encoded-path>/`
+/// and surfaced in `thread/list`. Selecting a historical thread passes
+/// `--resume <session-id>` so Claude resumes the exact conversation.
 pub(crate) async fn spawn_claude_session<E: EventSink>(
     entry: WorkspaceEntry,
     _client_version: String,
@@ -41,51 +67,219 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let _ = check_claude_installation().await?;
 
     let thread_id = format!("thread_{}", uuid::Uuid::new_v4());
-
-    let mut command = Command::new("claude");
-    command.args(["chat", "--output-format", "stream-json", "--verbose"]);
-    command.current_dir(&entry.path);
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Failed to spawn Claude CLI: {e}"))?;
-
-    let stdin = child.stdin.take().ok_or("missing stdin")?;
-    let stdout = child.stdout.take().ok_or("missing stdout")?;
-    let stderr = child.stderr.take().ok_or("missing stderr")?;
-
     let workspace_id = entry.id.clone();
     let workspace_path = entry.path.clone();
 
-    // Shared model name: updated by event loop, read by interceptor
+    // Channel: interceptor (sync) → coordinator task (async)
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<TurnRequest>();
+
+    // Shared session history: loaded at startup, refreshed after each turn.
+    let sessions: Arc<std::sync::Mutex<Vec<ClaudeSession>>> = Arc::new(
+        std::sync::Mutex::new(read_claude_sessions(&workspace_path)),
+    );
+
+    // Maps thread_id → resolved session_id (populated after first new-conv turn).
+    let thread_session_map: Arc<std::sync::Mutex<HashMap<String, String>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // Shared detected model: updated by coordinator, read by interceptor.
     let detected_model: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let detected_model_for_interceptor = detected_model.clone();
+    let active_interrupts: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<()>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    // Build the request interceptor for Claude CLI protocol translation
+    // Spawn a dummy child process to satisfy WorkspaceSession's type requirements.
+    // The dummy's stdin is never written to — all actual work is done per-turn
+    // by the coordinator task below.
+    let mut dummy_child = Command::new("cmd")
+        .args(["/c", "exit", "0"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn dummy process: {e}"))?;
+    let dummy_stdin = dummy_child.stdin.take().ok_or("missing dummy stdin")?;
+
+    // Build the request interceptor.
+    // turn/start and turn/steer are short-circuited: prompt+threadId go to
+    // the coordinator via channel, an immediate ack is returned to the caller.
     let interceptor_thread_id = thread_id.clone();
     let interceptor_workspace_id = workspace_id.clone();
+    let interceptor_workspace_path = workspace_path.clone();
+    let detected_model_for_interceptor = detected_model.clone();
+    let sessions_for_interceptor = sessions.clone();
+    let active_interrupts_for_interceptor = active_interrupts.clone();
     let interceptor: Arc<dyn Fn(Value) -> InterceptAction + Send + Sync> =
         Arc::new(move |value: Value| {
-            let model = detected_model_for_interceptor
-                .lock()
-                .ok()
-                .and_then(|g| g.clone());
-            build_claude_intercept_action(
-                &value,
-                &interceptor_thread_id,
-                &interceptor_workspace_id,
-                model.as_deref(),
-            )
+            let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let id = value.get("id").cloned();
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+
+            match method {
+                "turn/start" | "turn/steer" => {
+                    let text = extract_user_text(&params);
+                    if text.is_empty() {
+                        return if let Some(id) = id {
+                            InterceptAction::Respond(json!({
+                                "id": id,
+                                "error": { "message": format!("Empty {method} message") }
+                            }))
+                        } else {
+                            InterceptAction::Drop
+                        };
+                    }
+                    let tid = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&interceptor_thread_id)
+                        .to_string();
+                    let turn_id = format!("turn_{}", uuid::Uuid::new_v4());
+                    let _ = prompt_tx.send(TurnRequest {
+                        prompt: text,
+                        thread_id: tid.clone(),
+                        turn_id: turn_id.clone(),
+                    });
+                    if let Some(id) = id {
+                        InterceptAction::Respond(json!({
+                            "id": id,
+                            "result": {
+                                "turn": {
+                                    "id": turn_id,
+                                    "threadId": tid
+                                }
+                            }
+                        }))
+                    } else {
+                        InterceptAction::Drop
+                    }
+                }
+
+                "turn/interrupt" => {
+                    let tid = params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&interceptor_thread_id)
+                        .to_string();
+                    if let Some(sender) = active_interrupts_for_interceptor
+                        .lock()
+                        .unwrap()
+                        .remove(&tid)
+                    {
+                        let _ = sender.send(());
+                    }
+                    if let Some(id) = id {
+                        InterceptAction::Respond(json!({
+                            "id": id,
+                            "result": { "ok": true }
+                        }))
+                    } else {
+                        InterceptAction::Drop
+                    }
+                }
+
+                "thread/list" => {
+                    if let Some(id) = id {
+                        let hist = sessions_for_interceptor
+                            .lock()
+                            .ok()
+                            .map(|s| s.clone())
+                            .unwrap_or_default();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let mut data = vec![json!({
+                            "id": interceptor_thread_id,
+                            "name": "New conversation",
+                            "preview": "New conversation",
+                            "status": "active",
+                            "source": "appServer",
+                            "createdAt": now_ms,
+                            "updatedAt": now_ms,
+                            "cwd": interceptor_workspace_path
+                        })];
+                        for s in &hist {
+                            data.push(json!({
+                                "id": s.session_id,
+                                "name": s.name,
+                                "preview": s.name,
+                                "status": "idle",
+                                "source": "appServer",
+                                "createdAt": s.last_active_ms,
+                                "updatedAt": s.last_active_ms,
+                                "cwd": interceptor_workspace_path
+                            }));
+                        }
+                        InterceptAction::Respond(json!({
+                            "id": id,
+                            "result": { "data": data }
+                        }))
+                    } else {
+                        InterceptAction::Drop
+                    }
+                }
+
+                "thread/resume" => {
+                    if let Some(id) = id {
+                        let tid = params
+                            .get("threadId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&interceptor_thread_id);
+                        // Look up the session name for historical threads.
+                        let session_name = sessions_for_interceptor
+                            .lock()
+                            .ok()
+                            .and_then(|sessions| {
+                                sessions.iter().find(|s| s.session_id == tid).map(|s| s.name.clone())
+                            });
+                        let preview = session_name.unwrap_or_else(|| "New conversation".to_string());
+                        // Load conversation items from the JSONL session file.
+                        let items = read_session_items(&interceptor_workspace_path, tid);
+                        let turns = if items.is_empty() {
+                            json!([])
+                        } else {
+                            json!([{
+                                "id": format!("turn-resume-{tid}"),
+                                "status": "completed",
+                                "items": items
+                            }])
+                        };
+                        InterceptAction::Respond(json!({
+                            "id": id,
+                            "result": {
+                                "threadId": tid,
+                                "thread": {
+                                    "id": tid,
+                                    "status": "active",
+                                    "preview": preview,
+                                    "turns": turns
+                                }
+                            }
+                        }))
+                    } else {
+                        InterceptAction::Drop
+                    }
+                }
+
+                _ => {
+                    let model = detected_model_for_interceptor
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    build_claude_intercept_action(
+                        &value,
+                        &interceptor_thread_id,
+                        &interceptor_workspace_id,
+                        model.as_deref(),
+                    )
+                }
+            }
         });
 
     let session = Arc::new(WorkspaceSession {
         codex_args: None,
-        child: Mutex::new(child),
-        stdin: Mutex::new(stdin),
+        child: Mutex::new(dummy_child),
+        stdin: Mutex::new(dummy_stdin),
         pending: Mutex::new(HashMap::new()),
         request_context: Mutex::new(HashMap::new()),
         thread_workspace: Mutex::new(HashMap::new()),
@@ -96,44 +290,234 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
         workspace_ids: Mutex::new(HashSet::from([workspace_id.clone()])),
         workspace_roots: Mutex::new(HashMap::from([(
             workspace_id.clone(),
-            workspace_path,
+            workspace_path.clone(),
         )])),
         request_interceptor: Some(interceptor),
     });
 
-    // Spawn Claude stdout reader with event translation
-    let event_sink_stdout = event_sink.clone();
-    let ws_id_stdout = workspace_id.clone();
-    let stdout_thread_id = thread_id.clone();
-    let detected_model_for_loop = detected_model.clone();
+    // Coordinator task: one `claude --print` process per turn.
+    let coord_workspace_id = workspace_id.clone();
+    let coord_workspace_path = workspace_path.clone();
+    let coord_thread_id = thread_id.clone();
+    let coord_event_sink = event_sink.clone();
+    let coord_detected_model = detected_model.clone();
+    let coord_sessions = sessions.clone();
+    let coord_thread_session_map = thread_session_map.clone();
+    let coord_active_interrupts = active_interrupts.clone();
     tokio::spawn(async move {
-        let mut bridge_state = BridgeState::new(ws_id_stdout.clone(), stdout_thread_id);
+        while let Some(request) = prompt_rx.recv().await {
+            let session_arg = {
+                let map = coord_thread_session_map.lock().unwrap();
+                match map.get(&request.thread_id) {
+                    Some(sid) => SessionArg::Resume(sid.clone()),
+                    None => {
+                        if request.thread_id == coord_thread_id {
+                            SessionArg::New
+                        } else {
+                            SessionArg::Resume(request.thread_id.clone())
+                        }
+                    }
+                }
+            };
+
+            let (interrupt_tx, interrupt_rx) = oneshot::channel();
+            coord_active_interrupts
+                .lock()
+                .unwrap()
+                .insert(request.thread_id.clone(), interrupt_tx);
+
+            run_claude_turn(
+                &request.prompt,
+                &coord_workspace_path,
+                &coord_workspace_id,
+                &request.thread_id,
+                &request.turn_id,
+                session_arg,
+                interrupt_rx,
+                &coord_event_sink,
+                &coord_detected_model,
+            )
+            .await;
+
+            coord_active_interrupts
+                .lock()
+                .unwrap()
+                .remove(&request.thread_id);
+
+            if !coord_thread_session_map
+                .lock()
+                .unwrap()
+                .contains_key(&request.thread_id)
+                && request.thread_id == coord_thread_id
+            {
+                let fresh = read_claude_sessions(&coord_workspace_path);
+                if let Some(newest) = fresh.first() {
+                    coord_thread_session_map
+                        .lock()
+                        .unwrap()
+                        .insert(request.thread_id.clone(), newest.session_id.clone());
+                }
+            }
+
+            *coord_sessions.lock().unwrap() = read_claude_sessions(&coord_workspace_path);
+        }
+    });
+
+    // Emit codex/connected immediately so the UI knows the session is ready
+    event_sink.emit_app_server_event(AppServerEvent {
+        workspace_id: workspace_id.clone(),
+        message: json!({
+            "method": "codex/connected",
+            "params": { "workspaceId": workspace_id }
+        }),
+    });
+
+    Ok(session)
+}
+
+/// Run a single claude turn: spawn `claude --print --output-format stream-json`,
+/// deliver the prompt via stdin (EOF signals end of input), stream events back
+/// via `event_sink`, then wait for the process to exit.
+async fn run_claude_turn<E: EventSink>(
+    prompt: &str,
+    workspace_path: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    session_arg: SessionArg,
+    mut interrupt_rx: oneshot::Receiver<()>,
+    event_sink: &E,
+    detected_model: &Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let mut command = Command::new("claude");
+    command.args(["--output-format", "stream-json", "--print"]);
+    match &session_arg {
+        SessionArg::New => {}
+        SessionArg::Continue => {
+            command.arg("--continue");
+        }
+        SessionArg::Resume(sid) => {
+            command.args(["--resume", sid]);
+        }
+    }
+    command.current_dir(workspace_path);
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    // Remove the env var that blocks nested Claude CLI sessions
+    command.env_remove("CLAUDECODE");
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            event_sink.emit_app_server_event(AppServerEvent {
+                workspace_id: workspace_id.to_string(),
+                message: json!({
+                    "method": "error",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "willRetry": false,
+                        "error": { "message": format!("Failed to spawn claude: {e}") }
+                    }
+                }),
+            });
+            return;
+        }
+    };
+
+    // Write prompt to stdin and close it (EOF causes claude to start processing)
+    if let Some(mut stdin_handle) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin_handle.write_all(prompt.as_bytes()).await;
+        let _ = stdin_handle.write_all(b"\n").await;
+        // stdin_handle dropped here → EOF
+    }
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Read stderr concurrently in a spawned task
+    let stderr_event_sink = event_sink.clone();
+    let stderr_ws_id = workspace_id.to_string();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                stderr_event_sink.emit_app_server_event(AppServerEvent {
+                    workspace_id: stderr_ws_id.clone(),
+                    message: json!({
+                        "method": "codex/stderr",
+                        "params": { "message": line }
+                    }),
+                });
+            }
+        }
+    });
+
+    // Read stdout (stream-json events) in the current task
+    let mut bridge_state = BridgeState::new(
+        workspace_id.to_string(),
+        thread_id.to_string(),
+        turn_id.to_string(),
+    );
+    if let Some(stdout) = stdout {
         let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            let next_line = tokio::select! {
+                _ = &mut interrupt_rx => {
+                    let _ = child.start_kill();
+                    event_sink.emit_app_server_event(AppServerEvent {
+                        workspace_id: workspace_id.to_string(),
+                        message: json!({
+                            "method": "thread/status/changed",
+                            "params": {
+                                "threadId": thread_id,
+                                "status": { "type": "idle" }
+                            }
+                        }),
+                    });
+                    break;
+                }
+                result = lines.next_line() => result,
+            };
+            let next_line: Result<Option<String>, _> = next_line;
+            let Ok(Some(line)) = next_line else {
+                break;
+            };
             if line.trim().is_empty() {
                 continue;
             }
-
             let claude_event: super::types::ClaudeEvent = match serde_json::from_str(&line) {
                 Ok(e) => e,
                 Err(err) => {
-                    let payload = AppServerEvent {
-                        workspace_id: ws_id_stdout.clone(),
+                    event_sink.emit_app_server_event(AppServerEvent {
+                        workspace_id: workspace_id.to_string(),
                         message: json!({
-                            "method": "codex/parseError",
-                            "params": { "error": err.to_string(), "raw": line },
+                            "method": "error",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                                "willRetry": false,
+                                "error": {
+                                    "message": format!("Failed to parse Claude stream event: {err}")
+                                }
+                            }
                         }),
-                    };
-                    event_sink_stdout.emit_app_server_event(payload);
+                    });
                     continue;
                 }
             };
 
             let codex_messages = event_mapper::map_event(&claude_event, &mut bridge_state);
 
-            // Propagate detected model to the shared interceptor state
+            // Propagate detected model to interceptor
             if let Some(ref model) = bridge_state.model {
-                if let Ok(mut guard) = detected_model_for_loop.lock() {
+                if let Ok(mut guard) = detected_model.lock() {
                     if guard.as_ref() != Some(model) {
                         *guard = Some(model.clone());
                     }
@@ -141,46 +525,16 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
             }
 
             for message in codex_messages {
-                let payload = AppServerEvent {
-                    workspace_id: ws_id_stdout.clone(),
+                event_sink.emit_app_server_event(AppServerEvent {
+                    workspace_id: workspace_id.to_string(),
                     message,
-                };
-                event_sink_stdout.emit_app_server_event(payload);
+                });
             }
         }
-    });
+    }
 
-    // Spawn Claude stderr reader
-    let event_sink_stderr = event_sink.clone();
-    let ws_id_stderr = workspace_id.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let payload = AppServerEvent {
-                workspace_id: ws_id_stderr.clone(),
-                message: json!({
-                    "method": "codex/stderr",
-                    "params": { "message": line },
-                }),
-            };
-            event_sink_stderr.emit_app_server_event(payload);
-        }
-    });
-
-    // Emit codex/connected immediately
-    let payload = AppServerEvent {
-        workspace_id: workspace_id.clone(),
-        message: json!({
-            "method": "codex/connected",
-            "params": { "workspaceId": workspace_id }
-        }),
-    };
-    event_sink.emit_app_server_event(payload);
-
-    Ok(session)
+    let _ = stderr_task.await;
+    let _ = child.wait().await;
 }
 
 /// Format a model ID like "claude-sonnet-4-20250514" into a display name
@@ -247,32 +601,15 @@ fn build_claude_intercept_action(
 
         "initialized" => InterceptAction::Drop,
 
-        "turn/start" => {
-            let text = extract_user_text(&params);
-            if text.is_empty() {
-                if let Some(id) = id {
-                    return InterceptAction::Respond(json!({
-                        "id": id,
-                        "error": { "message": "Empty user message" }
-                    }));
-                }
-                return InterceptAction::Drop;
+        "turn/start" | "turn/steer" | "turn/interrupt" => {
+            if let Some(id) = id {
+                InterceptAction::Respond(json!({
+                    "id": id,
+                    "error": { "message": "Claude bridge routes this request via the coordinator" }
+                }))
+            } else {
+                InterceptAction::Drop
             }
-            InterceptAction::Forward(text)
-        }
-
-        "turn/steer" => {
-            let text = extract_user_text(&params);
-            if text.is_empty() {
-                if let Some(id) = id {
-                    return InterceptAction::Respond(json!({
-                        "id": id,
-                        "error": { "message": "Empty steer message" }
-                    }));
-                }
-                return InterceptAction::Drop;
-            }
-            InterceptAction::Forward(text)
         }
 
         "thread/start" => {
@@ -353,23 +690,12 @@ fn build_claude_intercept_action(
             }
         }
 
-        "turn/interrupt" => {
-            if let Some(id) = id {
-                InterceptAction::Respond(json!({
-                    "id": id,
-                    "result": { "ok": true }
-                }))
-            } else {
-                InterceptAction::Drop
-            }
-        }
-
         "thread/fork" | "thread/archive" | "thread/compact/start"
         | "thread/name/set" | "review/start" => {
             if let Some(id) = id {
                 InterceptAction::Respond(json!({
                     "id": id,
-                    "result": { "ok": true }
+                    "error": { "message": "Пока не поддерживается" }
                 }))
             } else {
                 InterceptAction::Drop
@@ -393,7 +719,7 @@ fn build_claude_intercept_action(
             if let Some(id) = id {
                 InterceptAction::Respond(json!({
                     "id": id,
-                    "result": {}
+                    "error": { "message": "Пока не поддерживается" }
                 }))
             } else {
                 InterceptAction::Drop
@@ -481,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_turn_start_forwards_text() {
+    fn intercept_turn_start_reports_coordinator_routing() {
         let action = build_claude_intercept_action(
             &json!({
                 "id": 2,
@@ -495,8 +821,13 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Forward(text) => assert_eq!(text, "What is Rust?"),
-            _ => panic!("Expected Forward"),
+            InterceptAction::Respond(v) => {
+                assert!(v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("coordinator"));
+            }
+            _ => panic!("Expected Respond"),
         }
     }
 
@@ -620,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_turn_steer_forwards_text() {
+    fn intercept_turn_steer_reports_coordinator_routing() {
         let action = build_claude_intercept_action(
             &json!({
                 "id": 20,
@@ -632,8 +963,13 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Forward(text) => assert_eq!(text, "Actually, do this instead"),
-            _ => panic!("Expected Forward"),
+            InterceptAction::Respond(v) => {
+                assert!(v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("coordinator"));
+            }
+            _ => panic!("Expected Respond"),
         }
     }
 
@@ -651,7 +987,10 @@ mod tests {
         );
         match action {
             InterceptAction::Respond(v) => {
-                assert!(v["error"]["message"].as_str().unwrap().contains("Empty steer"));
+                assert!(v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("coordinator"));
             }
             _ => panic!("Expected Respond with error"),
         }
@@ -708,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_thread_fork_responds_ok() {
+    fn intercept_thread_fork_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 32, "method": "thread/fork"}),
             "t1",
@@ -718,14 +1057,14 @@ mod tests {
         match action {
             InterceptAction::Respond(v) => {
                 assert_eq!(v["id"], 32);
-                assert_eq!(v["result"]["ok"], true);
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
             }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_thread_archive_responds_ok() {
+    fn intercept_thread_archive_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 33, "method": "thread/archive"}),
             "t1",
@@ -733,13 +1072,15 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
+            }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_thread_compact_start_responds_ok() {
+    fn intercept_thread_compact_start_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 34, "method": "thread/compact/start"}),
             "t1",
@@ -747,13 +1088,15 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
+            }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_thread_name_set_responds_ok() {
+    fn intercept_thread_name_set_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 35, "method": "thread/name/set"}),
             "t1",
@@ -761,13 +1104,15 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
+            }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_review_start_responds_ok() {
+    fn intercept_review_start_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 36, "method": "review/start"}),
             "t1",
@@ -775,7 +1120,9 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Respond(v) => assert_eq!(v["result"]["ok"], true),
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
+            }
             _ => panic!("Expected Respond"),
         }
     }
@@ -861,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_account_read_responds_empty() {
+    fn intercept_account_read_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 50, "method": "account/read"}),
             "t1",
@@ -871,14 +1218,14 @@ mod tests {
         match action {
             InterceptAction::Respond(v) => {
                 assert_eq!(v["id"], 50);
-                assert!(v["result"].is_object());
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
             }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_account_rate_limits_read_responds() {
+    fn intercept_account_rate_limits_read_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 51, "method": "account/rateLimits/read"}),
             "t1",
@@ -886,13 +1233,16 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Respond(v) => assert_eq!(v["id"], 51),
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["id"], 51);
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
+            }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_account_login_start_responds() {
+    fn intercept_account_login_start_returns_unsupported_error() {
         let action = build_claude_intercept_action(
             &json!({"id": 52, "method": "account/login/start"}),
             "t1",
@@ -900,13 +1250,16 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Respond(v) => assert_eq!(v["id"], 52),
+            InterceptAction::Respond(v) => {
+                assert_eq!(v["id"], 52);
+                assert_eq!(v["error"]["message"], "Пока не поддерживается");
+            }
             _ => panic!("Expected Respond"),
         }
     }
 
     #[test]
-    fn intercept_turn_interrupt_responds_ok() {
+    fn intercept_turn_interrupt_reports_coordinator_routing() {
         let action = build_claude_intercept_action(
             &json!({"id": 60, "method": "turn/interrupt"}),
             "t1",
@@ -916,7 +1269,10 @@ mod tests {
         match action {
             InterceptAction::Respond(v) => {
                 assert_eq!(v["id"], 60);
-                assert_eq!(v["result"]["ok"], true);
+                assert!(v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("coordinator"));
             }
             _ => panic!("Expected Respond"),
         }
@@ -1002,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_turn_start_with_text_field() {
+    fn intercept_turn_start_with_text_field_reports_coordinator_routing() {
         let action = build_claude_intercept_action(
             &json!({
                 "id": 70,
@@ -1014,8 +1370,13 @@ mod tests {
             None,
         );
         match action {
-            InterceptAction::Forward(text) => assert_eq!(text, "Simple text"),
-            _ => panic!("Expected Forward"),
+            InterceptAction::Respond(v) => {
+                assert!(v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("coordinator"));
+            }
+            _ => panic!("Expected Respond"),
         }
     }
 

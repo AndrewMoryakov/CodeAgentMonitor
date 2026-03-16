@@ -12,6 +12,7 @@ type UseModelsOptions = {
   preferredModelId?: string | null;
   preferredEffort?: string | null;
   selectionKey?: string | null;
+  backendMode?: string | null;
 };
 
 const CONFIG_MODEL_DESCRIPTION = "Configured in CODEX_HOME/config.toml";
@@ -42,6 +43,7 @@ export function useModels({
   preferredModelId = null,
   preferredEffort = null,
   selectionKey = null,
+  backendMode = null,
 }: UseModelsOptions) {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [configModel, setConfigModel] = useState<string | null>(null);
@@ -144,6 +146,13 @@ export function useModels({
     [preferredEffort, selectedEffort],
   );
 
+  // Reset cached workspace when backend mode changes so models are re-fetched
+  useEffect(() => {
+    lastFetchedWorkspaceId.current = null;
+    setModels([]);
+    hasUserSelectedModel.current = false;
+  }, [backendMode]);
+
   const refreshModels = useCallback(async () => {
     if (!workspaceId || !isConnected) {
       return;
@@ -162,7 +171,7 @@ export function useModels({
     try {
       const [modelListResult, configModelResult] = await Promise.allSettled([
         getModelList(workspaceId),
-        getConfigModel(workspaceId),
+        backendMode === "claude" ? Promise.resolve(null) : getConfigModel(workspaceId),
       ]);
       const configModelFromConfig =
         configModelResult.status === "fulfilled"
@@ -255,6 +264,7 @@ export function useModels({
       inFlight.current = false;
     }
   }, [
+    backendMode,
     isConnected,
     onDebug,
     preferredModelId,

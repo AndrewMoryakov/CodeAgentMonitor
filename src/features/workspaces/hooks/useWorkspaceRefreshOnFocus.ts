@@ -65,7 +65,16 @@ export function useWorkspaceRefreshOnFocus({
         }
         const connected = latestWorkspaces.filter((entry) => entry.connected);
         if (connected.length > 0) {
-          await listThreads(connected, { preserveState: true });
+          const { backendMode: currentMode } = optionsRef.current;
+          if (currentMode === "claude") {
+            // In Claude mode each workspace has its own session, so list
+            // threads individually to avoid one session overwriting others.
+            for (const ws of connected) {
+              await listThreads([ws], { preserveState: true });
+            }
+          } else {
+            await listThreads(connected, { preserveState: true });
+          }
         }
       })().finally(() => {
         refreshInFlight = false;

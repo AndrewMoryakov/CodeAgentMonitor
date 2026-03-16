@@ -62,6 +62,10 @@ type SettingsServerSectionProps = {
   onTcpDaemonStop: () => Promise<void>;
   onTcpDaemonStatus: () => Promise<void>;
   onMobileConnectTest: () => void;
+  claudeCheckStatus: string | null;
+  claudeCheckBusy: boolean;
+  claudeCheckError: boolean;
+  onCheckClaudeInstallation: () => void;
 };
 
 export function SettingsServerSection({
@@ -106,6 +110,10 @@ export function SettingsServerSection({
   onTcpDaemonStop,
   onTcpDaemonStatus,
   onMobileConnectTest,
+  claudeCheckStatus,
+  claudeCheckBusy,
+  claudeCheckError,
+  onCheckClaudeInstallation,
 }: SettingsServerSectionProps) {
   const [pendingDeleteRemoteId, setPendingDeleteRemoteId] = useState<string | null>(
     null,
@@ -188,31 +196,58 @@ export function SettingsServerSection({
     >
 
       {!isMobileSimplified && (
-        <div className="settings-field">
-          <label className="settings-field-label" htmlFor="backend-mode">
-            Backend mode
-          </label>
-          <select
-            id="backend-mode"
-            className="settings-select"
-            value={appSettings.backendMode}
-            onChange={(event) =>
-              void onUpdateAppSettings({
-                ...appSettings,
-                backendMode: event.target.value as AppSettings["backendMode"],
-              })
-            }
-          >
-            <option value="local">Local (default)</option>
-            <option value="remote">Remote (daemon)</option>
-            <option value="claude">Claude CLI</option>
-          </select>
-          <div className="settings-help">
-            Local keeps desktop requests in-process. Remote routes requests through the TCP transport
-            path used by mobile clients. Claude CLI uses the locally-installed claude command as the
-            AI backend.
+        <>
+          <div className="settings-field">
+            <label className="settings-field-label" htmlFor="backend-mode">
+              Backend mode
+            </label>
+            <select
+              id="backend-mode"
+              className="settings-select"
+              value={appSettings.backendMode}
+              onChange={(event) =>
+                void onUpdateAppSettings({
+                  ...appSettings,
+                  backendMode: event.target.value as AppSettings["backendMode"],
+                })
+              }
+            >
+              <option value="local">Local (default)</option>
+              <option value="remote">Remote (daemon)</option>
+              <option value="claude">Claude CLI</option>
+            </select>
+            <div className="settings-help">
+              Local keeps desktop requests in-process. Remote routes requests through the TCP
+              transport path used by mobile clients. Claude CLI uses the locally-installed claude
+              command as the AI backend.
+            </div>
           </div>
-        </div>
+
+          {appSettings.backendMode === "claude" && (
+            <div className="settings-field">
+              <div className="settings-field-label">Claude CLI status</div>
+              <div className="settings-field-row">
+                <button
+                  type="button"
+                  className="button settings-button-compact"
+                  onClick={onCheckClaudeInstallation}
+                  disabled={claudeCheckBusy}
+                >
+                  {claudeCheckBusy ? "Checking..." : "Re-check"}
+                </button>
+              </div>
+              {claudeCheckStatus && (
+                <div className={`settings-help${claudeCheckError ? " settings-help-error" : ""}`}>
+                  {claudeCheckStatus}
+                </div>
+              )}
+              <div className="settings-help">
+                Requires <code>claude</code> CLI installed and authenticated. Run{" "}
+                <code>claude --version</code> in a terminal to verify.
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <>

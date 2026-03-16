@@ -73,15 +73,23 @@ where
         }
         remove_session_references(sessions, &existing_for_entry).await;
     }
-    if let Some(existing_session) = take_live_shared_session(sessions).await {
-        existing_session
-            .register_workspace_with_path(&entry.id, Some(&entry.path))
-            .await;
-        sessions
-            .lock()
-            .await
-            .insert(entry.id.clone(), existing_session);
-        return Ok(());
+    // In Claude mode each workspace needs its own session (each interceptor
+    // is bound to a single workspace path), so skip session sharing.
+    let is_claude = {
+        let settings = app_settings.lock().await;
+        settings.backend_mode == crate::types::BackendMode::Claude
+    };
+    if !is_claude {
+        if let Some(existing_session) = take_live_shared_session(sessions).await {
+            existing_session
+                .register_workspace_with_path(&entry.id, Some(&entry.path))
+                .await;
+            sessions
+                .lock()
+                .await
+                .insert(entry.id.clone(), existing_session);
+            return Ok(());
+        }
     }
     let (default_bin, codex_args) = {
         let settings = app_settings.lock().await;
