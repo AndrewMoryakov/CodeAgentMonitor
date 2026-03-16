@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn bridge_state_new_initializes_correctly() {
-        let state = BridgeState::new("ws_1".to_string(), "thread_1".to_string());
+        let state = BridgeState::new("ws_1".to_string(), "thread_1".to_string(), "turn_test".to_string());
         assert_eq!(state.workspace_id, "ws_1");
         assert_eq!(state.thread_id, "thread_1");
         assert!(state.turn_id.starts_with("turn_"));
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn bridge_state_next_item_increments() {
-        let mut state = BridgeState::new("ws".to_string(), "t".to_string());
+        let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_test".to_string());
         assert_eq!(state.next_item(), "item_1");
         assert_eq!(state.next_item(), "item_2");
         assert_eq!(state.next_item(), "item_3");
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn bridge_state_new_turn_resets_per_turn_state() {
-        let mut state = BridgeState::new("ws".to_string(), "t".to_string());
+        let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_test".to_string());
         let original_turn_id = state.turn_id.clone();
         state.turn_started = true;
         state.block_items.insert(0, "item_1".to_string());
@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn bridge_state_new_turn_preserves_cumulative_state() {
-        let mut state = BridgeState::new("ws".to_string(), "t".to_string());
+        let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_test".to_string());
         state.total_input_tokens = 100;
         state.total_output_tokens = 50;
         state.total_cost_usd = 0.05;

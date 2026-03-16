@@ -844,6 +844,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -863,6 +864,7 @@ mod tests {
             "thread_abc",
             "ws_1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -880,6 +882,7 @@ mod tests {
             &json!({"id": 4, "method": "some/unknown"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -907,6 +910,7 @@ mod tests {
             }),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -944,6 +948,7 @@ mod tests {
             "t1",
             "w1",
             Some("claude-opus-4-20250514"),
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -964,11 +969,12 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
                 let data = v["result"]["data"].as_array().unwrap();
-                assert_eq!(data[0]["model"], "claude-sonnet-4-20250514");
+                assert_eq!(data[0]["model"], "claude-sonnet-4-6");
                 assert_eq!(data[0]["isDefault"], true);
             }
             _ => panic!("Expected Respond"),
@@ -985,6 +991,7 @@ mod tests {
             }),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1009,6 +1016,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1031,6 +1039,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         assert!(matches!(action, InterceptAction::Drop));
     }
@@ -1041,6 +1050,7 @@ mod tests {
             &json!({"id": 30, "method": "thread/start"}),
             "thread_xyz",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1061,6 +1071,7 @@ mod tests {
             "thread_abc",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1077,6 +1088,7 @@ mod tests {
             &json!({"id": 32, "method": "thread/fork"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1095,6 +1107,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1110,6 +1123,7 @@ mod tests {
             &json!({"id": 34, "method": "thread/compact/start"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1127,6 +1141,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1142,6 +1157,7 @@ mod tests {
             &json!({"id": 36, "method": "review/start"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1159,6 +1175,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1174,6 +1191,7 @@ mod tests {
             &json!({"id": 41, "method": "app/list"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1191,6 +1209,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1206,6 +1225,7 @@ mod tests {
             &json!({"id": 43, "method": "experimentalFeature/list"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1223,6 +1243,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1238,6 +1259,7 @@ mod tests {
             &json!({"id": 50, "method": "account/read"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1256,6 +1278,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1273,6 +1296,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1289,6 +1313,7 @@ mod tests {
             &json!({"id": 60, "method": "turn/interrupt"}),
             "t1",
             "w1",
+            None,
             None,
         );
         match action {
@@ -1311,6 +1336,7 @@ mod tests {
                 "t1",
                 "w1",
                 None,
+            None,
             );
             assert!(
                 matches!(action, InterceptAction::Drop),
@@ -1329,6 +1355,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         assert!(matches!(action, InterceptAction::Drop));
     }
@@ -1339,6 +1366,7 @@ mod tests {
             &json!({"method": "completely/unknown"}),
             "t1",
             "w1",
+            None,
             None,
         );
         assert!(matches!(action, InterceptAction::Drop));
@@ -1393,6 +1421,7 @@ mod tests {
             "t1",
             "w1",
             None,
+            None,
         );
         match action {
             InterceptAction::Respond(v) => {
@@ -1411,6 +1440,7 @@ mod tests {
             &json!({"method": "initialize"}),
             "t1",
             "w1",
+            None,
             None,
         );
         assert!(matches!(action, InterceptAction::Drop));

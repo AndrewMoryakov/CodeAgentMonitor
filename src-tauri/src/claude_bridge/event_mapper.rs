@@ -554,7 +554,7 @@ mod tests {
     use crate::claude_bridge::types::*;
 
     fn make_state() -> BridgeState {
-        BridgeState::new("ws_test".to_string(), "thread_test".to_string())
+        BridgeState::new("ws_test".to_string(), "thread_test".to_string(), "turn_test".to_string())
     }
 
     #[test]
