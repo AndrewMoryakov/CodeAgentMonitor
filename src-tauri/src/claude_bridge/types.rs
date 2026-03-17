@@ -36,9 +36,32 @@ pub(crate) enum ClaudeEvent {
     #[serde(rename = "result")]
     Result(ResultEvent),
 
+    /// Wrapper for granular streaming events (with --include-partial-messages).
+    /// Contains the actual event in the `event` field.
+    #[serde(rename = "stream_event")]
+    StreamEvent(StreamEventWrapper),
+
+    /// Rate limit info (ignored).
+    #[serde(rename = "rate_limit_event")]
+    RateLimitEvent(RateLimitEventData),
+
     /// Unknown/unhandled event type - captured as raw JSON.
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StreamEventWrapper {
+    #[serde(default)]
+    pub(crate) event: Option<Value>,
+    #[serde(flatten)]
+    pub(crate) _extra: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RateLimitEventData {
+    #[serde(flatten)]
+    pub(crate) _extra: std::collections::HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,6 +266,10 @@ pub(crate) struct BridgeState {
     pub(crate) total_output_tokens: u64,
     /// Cumulative cost in USD across all turns.
     pub(crate) total_cost_usd: f64,
+    /// Last assistant message ID seen (for deduplicating progressive content).
+    pub(crate) last_assistant_msg_id: String,
+    /// Number of content blocks already processed for `last_assistant_msg_id`.
+    pub(crate) last_assistant_block_count: usize,
 }
 
 impl BridgeState {
@@ -263,6 +290,8 @@ impl BridgeState {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cost_usd: 0.0,
+            last_assistant_msg_id: String::new(),
+            last_assistant_block_count: 0,
         }
     }
 
@@ -279,6 +308,8 @@ impl BridgeState {
         self.block_item_payloads.clear();
         self.tool_items.clear();
         self.block_tool_use_ids.clear();
+        self.last_assistant_msg_id.clear();
+        self.last_assistant_block_count = 0;
     }
 }
 

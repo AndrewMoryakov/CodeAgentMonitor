@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
+
+use super::item_tracker;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeSession {
@@ -176,9 +179,66 @@ fn collect_assistant_text(msg_id: &str, lines: &[Value]) -> String {
     parts.join("\n\n")
 }
 
+/// Extract text from a tool_result content value (string or array of text blocks).
+fn extract_tool_result_text_from_content(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        let texts: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        return texts.join("\n");
+    }
+    String::new()
+}
+
+/// Build a human-readable command description for non-Bash tools.
+fn build_command_description(tool_name: &str, input: &Value) -> Option<String> {
+    match tool_name {
+        "Read" | "read_file" => {
+            let path = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            Some(format!("Read: {path}"))
+        }
+        "Grep" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            Some(format!("Grep: {pattern} in {path}"))
+        }
+        "Glob" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("Glob: {pattern}"))
+        }
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("WebFetch: {url}"))
+        }
+        "WebSearch" => {
+            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("WebSearch: {query}"))
+        }
+        _ => None,
+    }
+}
+
 /// Read conversation items from a Claude CLI JSONL session file.
 /// Returns items in the format expected by the frontend:
 /// `[{type: "userMessage", id, content}, {type: "agentMessage", id, text}, ...]`
+///
+/// Two-pass approach:
+/// - Pass 1: Build a HashMap of tool_use_id → result_text from tool_result entries.
+/// - Pass 2: Emit userMessage, agentMessage, commandExecution, and fileChange items.
 pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<Value> {
     let encoded = encode_workspace_path(workspace_path);
     let root = match claude_projects_root() {
@@ -210,8 +270,35 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
             .collect()
     };
 
+    // ── Pass 1: collect tool results ──────────────────────────────
+    let mut tool_results: HashMap<String, String> = HashMap::new();
+    for obj in &parsed {
+        let msg = match obj.get("message") {
+            Some(m) if m.is_object() => m,
+            _ => continue,
+        };
+        let content_arr = match msg.get("content").and_then(|c| c.as_array()) {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for block in content_arr {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            if let Some(tuid) = block.get("tool_use_id").and_then(|v| v.as_str()) {
+                let text = block
+                    .get("content")
+                    .map(|c| extract_tool_result_text_from_content(c))
+                    .unwrap_or_default();
+                tool_results.insert(tuid.to_string(), text);
+            }
+        }
+    }
+
+    // ── Pass 2: build items ───────────────────────────────────────
     let mut items = Vec::new();
     let mut seen_assistant_ids = std::collections::HashSet::new();
+    let mut seen_tool_use_ids = std::collections::HashSet::new();
     let mut item_counter: u64 = 0;
 
     for obj in &parsed {
@@ -258,17 +345,96 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
                     continue;
                 }
                 seen_assistant_ids.insert(msg_id.to_string());
+
                 // Aggregate all text blocks for this message ID across JSONL lines.
                 let full_text = collect_assistant_text(msg_id, &parsed);
-                if full_text.is_empty() {
-                    continue;
+                if !full_text.is_empty() {
+                    item_counter += 1;
+                    items.push(json!({
+                        "type": "agentMessage",
+                        "id": format!("assistant-{item_counter}"),
+                        "text": full_text
+                    }));
                 }
-                item_counter += 1;
-                items.push(json!({
-                    "type": "agentMessage",
-                    "id": format!("assistant-{item_counter}"),
-                    "text": full_text
-                }));
+
+                // Scan all content blocks for tool_use entries across all
+                // JSONL lines sharing this message ID.
+                for line_obj in &parsed {
+                    if line_obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    let line_msg = match line_obj.get("message") {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let line_id = line_msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if line_id != msg_id {
+                        continue;
+                    }
+                    let content_arr = match line_msg.get("content").and_then(|c| c.as_array()) {
+                        Some(arr) => arr,
+                        None => continue,
+                    };
+                    for block in content_arr {
+                        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                            continue;
+                        }
+                        let tool_name = match block.get("name").and_then(|v| v.as_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let tool_use_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        // Skip duplicates: same tool_use block can appear in multiple
+                        // JSONL lines sharing the same message.id.
+                        if !seen_tool_use_ids.insert(tool_use_id.to_string()) {
+                            continue;
+                        }
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                        let result_text = tool_results
+                            .get(tool_use_id)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let category = item_tracker::classify_tool(tool_name);
+                        item_counter += 1;
+                        let item_id = format!("tool-{item_counter}");
+
+                        match category {
+                            item_tracker::ToolCategory::FileChange => {
+                                let path = item_tracker::extract_file_path(tool_name, &input)
+                                    .unwrap_or_default();
+                                let kind = item_tracker::infer_change_kind(tool_name);
+                                let mut change = json!({
+                                    "path": path,
+                                    "kind": kind,
+                                });
+                                if !result_text.is_empty() {
+                                    change["diff"] = json!(result_text);
+                                }
+                                items.push(json!({
+                                    "type": "fileChange",
+                                    "id": item_id,
+                                    "status": "completed",
+                                    "changes": [change]
+                                }));
+                            }
+                            _ => {
+                                // commandExecution for Bash, Read, Grep, Glob, and others
+                                let command = item_tracker::extract_command(tool_name, &input)
+                                    .or_else(|| build_command_description(tool_name, &input))
+                                    .unwrap_or_else(|| tool_name.to_string());
+                                items.push(json!({
+                                    "type": "commandExecution",
+                                    "id": item_id,
+                                    "command": command,
+                                    "status": "completed",
+                                    "aggregatedOutput": result_text,
+                                    "cwd": ""
+                                }));
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }

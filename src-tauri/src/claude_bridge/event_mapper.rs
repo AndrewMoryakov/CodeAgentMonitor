@@ -20,7 +20,25 @@ pub(crate) fn map_event(event: &ClaudeEvent, state: &mut BridgeState) -> Vec<Val
         ClaudeEvent::MessageStop(_) => map_message_stop(state),
         ClaudeEvent::Result(res) => map_result(res, state),
         ClaudeEvent::Assistant(a) => map_assistant(a, state),
+        ClaudeEvent::StreamEvent(wrapper) => map_stream_event(wrapper, state),
+        ClaudeEvent::RateLimitEvent(_) => vec![],
         ClaudeEvent::Unknown => vec![],
+    }
+}
+
+/// Unwrap a `stream_event` wrapper and re-dispatch the inner event.
+fn map_stream_event(
+    wrapper: &super::types::StreamEventWrapper,
+    state: &mut BridgeState,
+) -> Vec<Value> {
+    let Some(ref inner) = wrapper.event else {
+        return vec![];
+    };
+    // Try to deserialize the inner event as a ClaudeEvent.
+    // The inner event has standard types: message_start, content_block_start, etc.
+    match serde_json::from_value::<ClaudeEvent>(inner.clone()) {
+        Ok(inner_event) => map_event(&inner_event, state),
+        Err(_) => vec![],
     }
 }
 
@@ -34,15 +52,11 @@ fn map_system(
         state.model = Some(model.clone());
     }
 
-    // Emit codex/connected
-    out.push(json!({
-        "method": "codex/connected",
-        "params": {
-            "workspaceId": state.workspace_id
-        }
-    }));
+    // NOTE: codex/connected is NOT emitted here — it is already emitted once
+    // in spawn_claude_session(). Emitting it on every turn's system event
+    // would trigger reconnectLive() in the frontend, resetting thread state.
 
-    // Emit thread/started
+    // Emit thread/started (once per session)
     if !state.thread_started {
         state.thread_started = true;
         out.push(json!({
@@ -515,37 +529,17 @@ fn map_assistant(
     a: &super::types::AssistantEvent,
     state: &mut BridgeState,
 ) -> Vec<Value> {
-    // The top-level "assistant" event type is a fallback for simpler streaming
-    // modes. In full streaming mode, content_block events carry the data.
-    // Handle the "text" subtype as a simple message delta.
-    let mut out = Vec::new();
-    if a.subtype.as_deref() == Some("text") {
-        if let Some(ref msg) = a.message {
-            if let Some(text) = msg.as_str() {
-                state.accumulated_text.push_str(text);
-                let item_id = state
-                    .block_items
-                    .values()
-                    .next()
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let id = state.next_item();
-                        state.block_items.insert(0, id.clone());
-                        id
-                    });
-                out.push(json!({
-                    "method": "item/agentMessage/delta",
-                    "params": {
-                        "threadId": state.thread_id,
-                        "turnId": state.turn_id,
-                        "itemId": item_id,
-                        "delta": text
-                    }
-                }));
-            }
+    // With --include-partial-messages, the real streaming data comes via
+    // stream_event wrappers (message_start, content_block_*, message_stop).
+    // The top-level "assistant" events are just summary snapshots — we only
+    // extract the model from them and ignore the content (already handled
+    // by the granular stream_event flow).
+    if let Some(ref msg) = a.message {
+        if let Some(model) = msg.get("model").and_then(|v| v.as_str()) {
+            state.model = Some(model.to_string());
         }
     }
-    out
+    vec![]
 }
 
 #[cfg(test)]

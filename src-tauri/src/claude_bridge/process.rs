@@ -21,6 +21,8 @@ struct TurnRequest {
     /// The thread ID from `turn/start` params (may be a historical session UUID).
     thread_id: String,
     turn_id: String,
+    /// Model override from the UI dropdown (e.g. "claude-opus-4-6").
+    model: Option<String>,
 }
 
 /// How to identify the conversation session when spawning `claude --print`.
@@ -133,11 +135,16 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                         .and_then(|v| v.as_str())
                         .unwrap_or(&interceptor_thread_id)
                         .to_string();
+                    let model = params
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let turn_id = format!("turn_{}", uuid::Uuid::new_v4());
                     let _ = prompt_tx.send(TurnRequest {
                         prompt: text,
                         thread_id: tid.clone(),
                         turn_id: turn_id.clone(),
+                        model,
                     });
                     if let Some(id) = id {
                         InterceptAction::Respond(json!({
@@ -306,6 +313,8 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let coord_thread_session_map = thread_session_map.clone();
     let coord_active_interrupts = active_interrupts.clone();
     tokio::spawn(async move {
+        // Persist thread_started across turns so thread/started is only emitted once.
+        let mut thread_started = false;
         while let Some(request) = prompt_rx.recv().await {
             let session_arg = {
                 let map = coord_thread_session_map.lock().unwrap();
@@ -334,6 +343,8 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                 &request.thread_id,
                 &request.turn_id,
                 session_arg,
+                request.model.as_deref(),
+                &mut thread_started,
                 interrupt_rx,
                 &coord_event_sink,
                 &coord_detected_model,
@@ -386,12 +397,22 @@ async fn run_claude_turn<E: EventSink>(
     thread_id: &str,
     turn_id: &str,
     session_arg: SessionArg,
+    model: Option<&str>,
+    thread_started: &mut bool,
     mut interrupt_rx: oneshot::Receiver<()>,
     event_sink: &E,
     detected_model: &Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut command = Command::new("claude");
-    command.args(["--output-format", "stream-json", "--print"]);
+    command.args([
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--print",
+    ]);
+    if let Some(m) = model {
+        command.args(["--model", m]);
+    }
     match &session_arg {
         SessionArg::New => {}
         SessionArg::Continue => {
@@ -466,6 +487,8 @@ async fn run_claude_turn<E: EventSink>(
         thread_id.to_string(),
         turn_id.to_string(),
     );
+    bridge_state.thread_started = *thread_started;
+    let mut turn_completed = false;
     if let Some(stdout) = stdout {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -482,6 +505,7 @@ async fn run_claude_turn<E: EventSink>(
                             }
                         }),
                     });
+                    turn_completed = true; // interrupt handled, no synthetic completion needed
                     break;
                 }
                 result = lines.next_line() => result,
@@ -526,12 +550,34 @@ async fn run_claude_turn<E: EventSink>(
             }
 
             for message in codex_messages {
+                if message.get("method").and_then(|v| v.as_str()) == Some("turn/completed") {
+                    turn_completed = true;
+                }
                 event_sink.emit_app_server_event(AppServerEvent {
                     workspace_id: workspace_id.to_string(),
                     message,
                 });
             }
         }
+    }
+
+    // Persist thread_started for next turn.
+    *thread_started = bridge_state.thread_started;
+
+    // If the turn was started but never completed (crash/EOF), emit a
+    // synthetic turn/completed so the UI exits "processing" state.
+    if bridge_state.turn_started && !turn_completed {
+        event_sink.emit_app_server_event(AppServerEvent {
+            workspace_id: workspace_id.to_string(),
+            message: json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "status": "error"
+                }
+            }),
+        });
     }
 
     let _ = stderr_task.await;
