@@ -273,9 +273,7 @@ mod tests {
         settings.remote_backend_host = "tcp.example:4732".to_string();
 
         let config = resolve_transport_config(&settings).expect("transport config");
-        let RemoteTransportConfig::Tcp { host, .. } = config else {
-            panic!("expected tcp transport config");
-        };
+        let RemoteTransportConfig::Tcp { host, .. } = config;
         assert_eq!(host, "tcp.example:4732");
     }
 
@@ -304,9 +302,7 @@ mod tests {
         settings.active_remote_backend_id = Some("staging".to_string());
 
         let config = resolve_transport_config(&settings).expect("transport config");
-        let RemoteTransportConfig::Tcp { host, auth_token } = config else {
-            panic!("expected tcp transport config");
-        };
+        let RemoteTransportConfig::Tcp { host, auth_token } = config;
         assert_eq!(host, "staging.example:4732");
         assert!(auth_token.is_none());
     }
@@ -318,9 +314,7 @@ mod tests {
         settings.active_remote_backend_id = Some("nonexistent".to_string());
 
         let config = resolve_transport_config(&settings).expect("transport config");
-        let RemoteTransportConfig::Tcp { host, .. } = config else {
-            panic!("expected tcp transport config");
-        };
+        let RemoteTransportConfig::Tcp { host, .. } = config;
         assert_eq!(host, "fallback:4732");
     }
 

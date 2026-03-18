@@ -102,12 +102,12 @@ pub fn run() {
     let builder = tauri::Builder::default();
 
     let builder = builder
-        .on_window_event(|window, event| {
+        .on_window_event(|window, _event| {
             if window.label() != "main" {
                 return;
             }
             #[cfg(target_os = "macos")]
-            if let WindowEvent::CloseRequested { api, .. } = event {
+            if let WindowEvent::CloseRequested { api, .. } = _event {
                 api.prevent_close();
                 let _ = window.hide();
             }

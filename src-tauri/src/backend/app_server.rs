@@ -19,8 +19,6 @@ use crate::types::WorkspaceEntry;
 
 #[cfg(target_os = "windows")]
 use crate::shared::process_core::{build_cmd_c_command, resolve_windows_executable};
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 
 fn extract_thread_id(value: &Value) -> Option<String> {
     fn extract_from_container(container: Option<&Value>) -> Option<String> {
