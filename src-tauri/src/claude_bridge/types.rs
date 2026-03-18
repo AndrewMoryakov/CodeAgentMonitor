@@ -301,6 +301,8 @@ pub(crate) struct BridgeState {
     pub(crate) approval_id_counter: u64,
     /// Claude session ID from the system init event.
     pub(crate) claude_session_id: Option<String>,
+    /// Whether `thread/name/updated` has been emitted (emit only once).
+    pub(crate) thread_named: bool,
 }
 
 impl BridgeState {
@@ -326,6 +328,7 @@ impl BridgeState {
             pending_control_requests: HashMap::new(),
             approval_id_counter: 100_000,
             claude_session_id: None,
+            thread_named: false,
         }
     }
 
@@ -703,6 +706,7 @@ mod tests {
         assert!(state.pending_control_requests.is_empty());
         assert_eq!(state.approval_id_counter, 100_000);
         assert!(state.claude_session_id.is_none());
+        assert!(!state.thread_named);
     }
 
     #[test]

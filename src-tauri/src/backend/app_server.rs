@@ -503,6 +503,7 @@ impl WorkspaceSession {
                 InterceptAction::Forward(translated) => translated,
                 InterceptAction::Respond(response) => {
                     if let Some(id) = response.get("id").and_then(|v| v.as_u64()) {
+                        self.request_context.lock().await.remove(&id);
                         if let Some(tx) = self.pending.lock().await.remove(&id) {
                             let _ = tx.send(response);
                         }

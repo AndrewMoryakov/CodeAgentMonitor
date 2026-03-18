@@ -532,7 +532,7 @@ pub(crate) fn discover_models(workspace_path: &str) -> Vec<(String, String)> {
     seen_order
         .into_iter()
         .map(|id| {
-            let display = id.clone();
+            let display = format_model_name(&id);
             (id, display)
         })
         .collect()

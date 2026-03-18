@@ -11,13 +11,45 @@ pub(crate) mod home;
 use crate::backend::app_server::spawn_workspace_session as spawn_workspace_session_inner;
 pub(crate) use crate::backend::app_server::WorkspaceSession;
 use crate::backend::events::AppServerEvent;
-use crate::claude_bridge::process::spawn_claude_session;
+use crate::claude_bridge::process::{spawn_claude_session, PROCESS_EXITED_ERROR};
 use crate::event_sink::TauriEventSink;
 use crate::remote_backend;
 use crate::shared::agents_config_core;
 use crate::shared::codex_core;
 use crate::state::AppState;
 use crate::types::{BackendMode, WorkspaceEntry};
+
+fn is_process_exited_error(value: &Value) -> bool {
+    value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        == Some(PROCESS_EXITED_ERROR)
+}
+
+async fn respawn_claude_session(
+    workspace_id: &str,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<Arc<WorkspaceSession>, String> {
+    state.sessions.lock().await.remove(workspace_id);
+    let entry = {
+        let workspaces = state.workspaces.lock().await;
+        workspaces
+            .get(workspace_id)
+            .cloned()
+            .ok_or_else(|| format!("workspace {workspace_id} not found"))?
+    };
+    let client_version = app.package_info().version.to_string();
+    let event_sink = TauriEventSink::new(app.clone());
+    let new_session = spawn_claude_session(entry, client_version, event_sink).await?;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(workspace_id.to_string(), new_session.clone());
+    Ok(new_session)
+}
 
 fn emit_thread_live_event(app: &AppHandle, workspace_id: &str, method: &str, params: Value) {
     let _ = app.emit(
@@ -372,7 +404,20 @@ pub(crate) async fn send_user_message(
         .await;
     }
 
-    codex_core::send_user_message_core(
+    // Clone params for potential retry after respawn
+    let (ws2, tid2, txt2, m2, e2, am2, img2, ap2, cm2) = (
+        workspace_id.clone(),
+        thread_id.clone(),
+        text.clone(),
+        model.clone(),
+        effort.clone(),
+        access_mode.clone(),
+        images.clone(),
+        app_mentions.clone(),
+        collaboration_mode.clone(),
+    );
+
+    let result = codex_core::send_user_message_core(
         &state.sessions,
         &state.workspaces,
         workspace_id,
@@ -385,7 +430,28 @@ pub(crate) async fn send_user_message(
         app_mentions,
         collaboration_mode,
     )
-    .await
+    .await;
+
+    if let Ok(ref value) = result {
+        if is_process_exited_error(value) {
+            respawn_claude_session(&ws2, &*state, &app).await?;
+            return codex_core::send_user_message_core(
+                &state.sessions,
+                &state.workspaces,
+                ws2,
+                tid2,
+                txt2,
+                m2,
+                e2,
+                am2,
+                img2,
+                ap2,
+                cm2,
+            )
+            .await;
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -422,7 +488,17 @@ pub(crate) async fn turn_steer(
         .await;
     }
 
-    codex_core::turn_steer_core(
+    // Clone params for potential retry after respawn
+    let (ws2, tid2, tuid2, txt2, img2, ap2) = (
+        workspace_id.clone(),
+        thread_id.clone(),
+        turn_id.clone(),
+        text.clone(),
+        images.clone(),
+        app_mentions.clone(),
+    );
+
+    let result = codex_core::turn_steer_core(
         &state.sessions,
         workspace_id,
         thread_id,
@@ -431,7 +507,24 @@ pub(crate) async fn turn_steer(
         images,
         app_mentions,
     )
-    .await
+    .await;
+
+    if let Ok(ref value) = result {
+        if is_process_exited_error(value) {
+            respawn_claude_session(&ws2, &*state, &app).await?;
+            return codex_core::turn_steer_core(
+                &state.sessions,
+                ws2,
+                tid2,
+                tuid2,
+                txt2,
+                img2,
+                ap2,
+            )
+            .await;
+        }
+    }
+    result
 }
 
 #[tauri::command]
