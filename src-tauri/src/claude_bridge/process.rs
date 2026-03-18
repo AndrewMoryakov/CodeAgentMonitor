@@ -88,6 +88,10 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     // Process liveness flag: set by stdout_reader_task on EOF, checked by interceptor.
     let process_exited = Arc::new(AtomicBool::new(false));
 
+    // Resolve rules path for auto-approve checks.
+    let rules_path = crate::codex::home::resolve_default_codex_home()
+        .map(|home| crate::rules::default_rules_path(&home));
+
     // Spawn the persistent Claude CLI process.
     let mut child = Command::new("claude")
         .args([
@@ -142,6 +146,8 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let stdout_sessions = sessions.clone();
     let stdout_workspace_path = workspace_path.clone();
     let stdout_process_exited = process_exited.clone();
+    let stdout_stdin_tx = stdin_tx.clone();
+    let stdout_rules_path = rules_path;
     tokio::spawn(stdout_reader_task(
         child_stdout,
         stdout_bridge_state,
@@ -151,6 +157,8 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
         stdout_sessions,
         stdout_workspace_path,
         stdout_process_exited,
+        stdout_stdin_tx,
+        stdout_rules_path,
     ));
 
     // Spawn a dummy child process to satisfy WorkspaceSession's type requirements.
@@ -183,8 +191,6 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
             // ── Handle response messages (approval/userInput answers) ──
             if value.get("result").is_some() && method.is_empty() {
                 if let Some(resp_id) = value.get("id").and_then(|v| v.as_u64()) {
-                    let mut bs = interceptor_bridge_state.lock().unwrap();
-
                     // Check process liveness FIRST, before consuming pending entry.
                     if interceptor_process_exited.load(Ordering::Acquire) {
                         return InterceptAction::Respond(json!({
@@ -193,7 +199,12 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                         }));
                     }
 
-                    if let Some(pending) = bs.pending_control_requests.remove(&resp_id) {
+                    // Remove pending entry under lock, then release before serialization.
+                    let pending = {
+                        let mut bs = interceptor_bridge_state.lock().unwrap();
+                        bs.pending_control_requests.remove(&resp_id)
+                    };
+                    if let Some(pending) = pending {
                         let result_val = value.get("result").cloned().unwrap_or(Value::Null);
                         let ndjson = build_control_response(&pending, &result_val);
                         let _ = interceptor_stdin_tx.send(StdinMessage::ControlResponse(ndjson));
@@ -480,6 +491,8 @@ async fn stdout_reader_task<E: EventSink>(
     sessions: Arc<std::sync::Mutex<Vec<ClaudeSession>>>,
     workspace_path: String,
     process_exited: Arc<AtomicBool>,
+    stdin_tx: mpsc::UnboundedSender<StdinMessage>,
+    rules_path: Option<std::path::PathBuf>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
 
@@ -535,6 +548,54 @@ async fn stdout_reader_task<E: EventSink>(
             }
 
             messages
+        };
+
+        // Ack non-can_use_tool control_requests so Claude CLI doesn't hang.
+        if let super::types::ClaudeEvent::ControlRequest(ref cr) = claude_event {
+            let subtype = cr.request.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+            if subtype != "can_use_tool" && !cr.request_id.is_empty() {
+                let ack = json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": cr.request_id,
+                        "response": {}
+                    }
+                });
+                let _ = stdin_tx.send(StdinMessage::ControlResponse(
+                    serde_json::to_string(&ack).unwrap_or_default(),
+                ));
+            }
+        }
+
+        // Auto-approve tool calls that match remembered prefix rules.
+        let codex_messages = if let Some(ref rp) = rules_path {
+            let mut filtered = Vec::with_capacity(codex_messages.len());
+            for msg in codex_messages {
+                if msg.get("method").and_then(|v| v.as_str()) == Some("codex/requestApproval") {
+                    if let Some(approval_id) = msg.get("id").and_then(|v| v.as_u64()) {
+                        let cmd: Vec<&str> = msg["params"]["command"]
+                            .as_array()
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                            .unwrap_or_default();
+                        if !cmd.is_empty() && crate::rules::check_prefix_rules(rp, &cmd) {
+                            let mut bs = bridge_state.lock().unwrap();
+                            if let Some(pending) = bs.pending_control_requests.remove(&approval_id) {
+                                let ndjson = build_control_response(
+                                    &pending,
+                                    &json!({"decision": "accept"}),
+                                );
+                                let _ = stdin_tx.send(StdinMessage::ControlResponse(ndjson));
+                            }
+                            continue; // Don't emit — tool proceeds silently
+                        }
+                    }
+                }
+                filtered.push(msg);
+            }
+            filtered
+        } else {
+            codex_messages
         };
 
         for message in &codex_messages {

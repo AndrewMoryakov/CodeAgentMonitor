@@ -152,6 +152,125 @@ fn normalize_rule_value(value: &str) -> String {
     value.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
+/// Check if any `prefix_rule` with `decision = "allow"` matches the given
+/// command using prefix semantics: each pattern element must be a prefix of
+/// the corresponding command element, and the pattern may be shorter than
+/// the command (i.e. `["Bash"]` matches any `["Bash", ...]`).
+pub(crate) fn check_prefix_rules(path: &Path, command: &[&str]) -> bool {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for (pattern, allows) in parse_prefix_rules(&contents) {
+        if allows && prefix_matches(&pattern, command) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse all `prefix_rule` blocks, returning `(pattern, is_allow)` pairs.
+fn parse_prefix_rules(contents: &str) -> Vec<(Vec<String>, bool)> {
+    let mut rules = Vec::new();
+    let mut in_rule = false;
+    let mut pattern: Vec<String> = Vec::new();
+    let mut decision_allows = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("prefix_rule(") {
+            in_rule = true;
+            pattern.clear();
+            decision_allows = false;
+            continue;
+        }
+        if !in_rule {
+            continue;
+        }
+        if trimmed.starts_with("pattern") {
+            if let Some((_, value)) = trimmed.split_once('=') {
+                pattern = extract_string_list(value);
+            }
+        } else if trimmed.starts_with("decision") {
+            if let Some((_, value)) = trimmed.split_once('=') {
+                let candidate = value.trim().trim_end_matches(',');
+                if candidate.contains("\"allow\"") || candidate.contains("'allow'") {
+                    decision_allows = true;
+                }
+            }
+        } else if trimmed.starts_with(')') {
+            if !pattern.is_empty() {
+                rules.push((pattern.clone(), decision_allows));
+            }
+            in_rule = false;
+        }
+    }
+    rules
+}
+
+/// Extract a list of strings from a pattern value like `["Bash", "rm -rf"]`.
+fn extract_string_list(value: &str) -> Vec<String> {
+    let value = value.trim().trim_end_matches(',');
+    // Strip outer brackets
+    let inner = value
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(value);
+    inner
+        .split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            // Strip surrounding quotes
+            let unquoted = item
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| item.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
+            unquoted.map(|s| unescape_string(s))
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Reverse of escape_string: unescape common escape sequences.
+fn unescape_string(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Check if `pattern` is a prefix-match for `command`.
+/// Each pattern element must be a prefix of the corresponding command element.
+fn prefix_matches(pattern: &[String], command: &[&str]) -> bool {
+    if pattern.is_empty() || pattern.len() > command.len() {
+        return false;
+    }
+    for (p, c) in pattern.iter().zip(command.iter()) {
+        if !c.starts_with(p.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn escape_string(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -159,4 +278,138 @@ fn escape_string(value: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn prefix_matches_exact() {
+        let pattern = vec!["Bash".to_string(), "rm -rf /tmp".to_string()];
+        assert!(prefix_matches(&pattern, &["Bash", "rm -rf /tmp"]));
+    }
+
+    #[test]
+    fn prefix_matches_shorter_pattern() {
+        let pattern = vec!["Bash".to_string()];
+        assert!(prefix_matches(&pattern, &["Bash", "rm -rf /tmp"]));
+    }
+
+    #[test]
+    fn prefix_matches_element_prefix() {
+        let pattern = vec!["Bash".to_string(), "rm".to_string()];
+        assert!(prefix_matches(&pattern, &["Bash", "rm -rf /tmp"]));
+    }
+
+    #[test]
+    fn prefix_matches_rejects_mismatch() {
+        let pattern = vec!["Bash".to_string(), "ls".to_string()];
+        assert!(!prefix_matches(&pattern, &["Bash", "rm -rf /tmp"]));
+    }
+
+    #[test]
+    fn prefix_matches_rejects_empty_pattern() {
+        let pattern: Vec<String> = vec![];
+        assert!(!prefix_matches(&pattern, &["Bash", "rm"]));
+    }
+
+    #[test]
+    fn prefix_matches_rejects_longer_pattern() {
+        let pattern = vec!["Bash".to_string(), "rm".to_string(), "extra".to_string()];
+        assert!(!prefix_matches(&pattern, &["Bash", "rm"]));
+    }
+
+    #[test]
+    fn parse_prefix_rules_single_allow() {
+        let content = r#"
+prefix_rule(
+    pattern = ["Bash", "rm -rf /tmp"],
+    decision = "allow",
+)
+"#;
+        let rules = parse_prefix_rules(content);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, vec!["Bash", "rm -rf /tmp"]);
+        assert!(rules[0].1);
+    }
+
+    #[test]
+    fn parse_prefix_rules_deny_not_matched() {
+        let content = r#"
+prefix_rule(
+    pattern = ["Bash"],
+    decision = "deny",
+)
+"#;
+        let rules = parse_prefix_rules(content);
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].1); // not allow
+    }
+
+    #[test]
+    fn parse_prefix_rules_multiple() {
+        let content = r#"
+prefix_rule(
+    pattern = ["Bash"],
+    decision = "allow",
+)
+
+prefix_rule(
+    pattern = ["Write", "/src/main.rs"],
+    decision = "allow",
+)
+"#;
+        let rules = parse_prefix_rules(content);
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn extract_string_list_basic() {
+        let items = extract_string_list(r#"["Bash", "rm -rf /tmp"]"#);
+        assert_eq!(items, vec!["Bash", "rm -rf /tmp"]);
+    }
+
+    #[test]
+    fn extract_string_list_single() {
+        let items = extract_string_list(r#"["Bash"]"#);
+        assert_eq!(items, vec!["Bash"]);
+    }
+
+    #[test]
+    fn extract_string_list_with_escaped_quotes() {
+        let items = extract_string_list(r#"["echo \"hello\""]"#);
+        assert_eq!(items, vec![r#"echo "hello""#]);
+    }
+
+    #[test]
+    fn check_prefix_rules_from_file() {
+        let dir = std::env::temp_dir().join("rules_test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.rules");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"prefix_rule(
+    pattern = ["Bash", "git status"],
+    decision = "allow",
+)"#
+        )
+        .unwrap();
+
+        assert!(check_prefix_rules(&path, &["Bash", "git status"]));
+        assert!(check_prefix_rules(&path, &["Bash", "git status --short"]));
+        assert!(!check_prefix_rules(&path, &["Bash", "rm -rf /"]));
+        assert!(!check_prefix_rules(&path, &["Write", "something"]));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn check_prefix_rules_missing_file_returns_false() {
+        let path = std::path::PathBuf::from("/nonexistent/rules.txt");
+        assert!(!check_prefix_rules(&path, &["Bash", "ls"]));
+    }
 }
