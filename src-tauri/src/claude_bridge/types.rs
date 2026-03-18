@@ -303,6 +303,11 @@ pub(crate) struct BridgeState {
     pub(crate) claude_session_id: Option<String>,
     /// Whether `thread/name/updated` has been emitted (emit only once).
     pub(crate) thread_named: bool,
+    /// Whether Claude has sent any content events (message_start) for the
+    /// current turn.  Used by `map_result` to detect stale results from a
+    /// previous turn that arrive after the interceptor has already set up a
+    /// new turn (race between interceptor and stdout_reader_task).
+    pub(crate) turn_has_content: bool,
 }
 
 impl BridgeState {
@@ -329,6 +334,7 @@ impl BridgeState {
             approval_id_counter: 100_000,
             claude_session_id: None,
             thread_named: false,
+            turn_has_content: false,
         }
     }
 
@@ -354,6 +360,7 @@ impl BridgeState {
     pub(crate) fn new_turn_with_id(&mut self, turn_id: String) {
         self.turn_id = turn_id;
         self.turn_started = false;
+        self.turn_has_content = false;
         self.block_items.clear();
         self.block_item_payloads.clear();
         self.tool_items.clear();
@@ -707,6 +714,7 @@ mod tests {
         assert_eq!(state.approval_id_counter, 100_000);
         assert!(state.claude_session_id.is_none());
         assert!(!state.thread_named);
+        assert!(!state.turn_has_content);
     }
 
     #[test]

@@ -90,6 +90,10 @@ fn map_message_start(
         }
     }
 
+    // Mark that Claude actually started responding to this turn.
+    // Used by map_result to detect stale results from a previous turn.
+    state.turn_has_content = true;
+
     // Clear per-block maps to avoid index collisions across messages
     // within the same turn (e.g., tool_use message → tool_result message).
     // tool_items is preserved for cross-message tool correlation.
@@ -474,8 +478,16 @@ fn map_result(
         state.total_cost_usd += cost;
     }
 
+    // Detect stale results from a previous turn.  This can happen if the
+    // interceptor starts a new turn (resetting bridge_state) while a result
+    // event from the old turn is still in the stdout buffer.  In that case
+    // turn_started is true (set by the interceptor) but turn_has_content is
+    // false (Claude hasn't responded to the new turn yet).  A non-error
+    // result without any preceding content is definitely stale.
+    let is_stale = state.turn_started && !state.turn_has_content && !res.is_error;
+
     // Emit turn/completed with cost and duration
-    if state.turn_started {
+    if state.turn_started && !is_stale {
         if res.is_error {
             out.push(json!({
                 "method": "error",
@@ -536,11 +548,13 @@ fn map_result(
         }
     }
 
-    // Clear unanswered control requests from the completed turn.
-    state.pending_control_requests.clear();
-
-    // Prepare for next turn
-    state.new_turn();
+    // Only advance to next turn if this result belongs to the current turn.
+    // If stale, the interceptor has already set up the next turn — don't
+    // overwrite its state with new_turn().
+    if !is_stale {
+        state.pending_control_requests.clear();
+        state.new_turn();
+    }
 
     out
 }

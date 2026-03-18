@@ -153,6 +153,7 @@ fn tool_use_content_block_maps_to_command_execution() {
 fn result_event_emits_turn_completed_and_thread_name() {
     let mut state = make_state();
     state.turn_started = true;
+    state.turn_has_content = true;
     state.accumulated_text = "Here is the answer to your question".to_string();
 
     let event = ClaudeEvent::Result(ResultEvent {
@@ -567,6 +568,7 @@ fn result_event_emits_rate_limits_with_cost() {
 fn result_event_includes_cost_in_turn_completed() {
     let mut state = make_state();
     state.turn_started = true;
+    state.turn_has_content = true;
 
     let event = ClaudeEvent::Result(ResultEvent {
         subtype: None, result: None, error: None,
@@ -1041,6 +1043,7 @@ fn multiple_control_requests_get_unique_ids() {
 fn map_result_clears_pending_control_requests() {
     let mut state = make_state();
     state.turn_started = true;
+    state.turn_has_content = true;
     state.pending_control_requests.insert(
         100_000,
         PendingControlRequest {
@@ -1330,4 +1333,141 @@ fn tool_result_file_change_emits_completed_with_diff() {
     assert_eq!(changes[0]["path"], "hello.txt");
     assert_eq!(changes[0]["kind"], "add");
     assert_eq!(changes[0]["diff"], "file written");
+}
+
+// ── Stale result detection (BUG 3 race) ──────────────────────────
+
+#[test]
+fn stale_result_skips_turn_completed() {
+    let mut state = make_state();
+    // Simulate: interceptor started a new turn (turn_started=true)
+    // but Claude hasn't responded yet (turn_has_content=false).
+    state.turn_started = true;
+    state.turn_has_content = false;
+
+    let result_event = ClaudeEvent::Result(ResultEvent {
+        subtype: Some("success".to_string()),
+        result: None,
+        error: None,
+        duration_ms: Some(500),
+        duration_api_ms: None,
+        num_turns: Some(1),
+        is_error: false,
+        session_id: None,
+        cost_usd: Some(0.01),
+        usage: None,
+        extra: Default::default(),
+    });
+
+    let events = map_event(&result_event, &mut state);
+
+    // Stale non-error result: no turn/completed should be emitted
+    assert!(
+        !events.iter().any(|e| e["method"] == "turn/completed"),
+        "stale result must not emit turn/completed"
+    );
+    // turn_started should NOT have been reset (interceptor's state preserved)
+    assert!(state.turn_started);
+}
+
+#[test]
+fn stale_result_does_not_call_new_turn() {
+    let mut state = make_state();
+    state.turn_started = true;
+    state.turn_has_content = false;
+    let original_turn_id = state.turn_id.clone();
+
+    let result_event = ClaudeEvent::Result(ResultEvent {
+        subtype: None,
+        result: None,
+        error: None,
+        duration_ms: None,
+        duration_api_ms: None,
+        num_turns: None,
+        is_error: false,
+        session_id: None,
+        cost_usd: None,
+        usage: None,
+        extra: Default::default(),
+    });
+
+    let _ = map_event(&result_event, &mut state);
+
+    // turn_id should be unchanged — new_turn() was NOT called
+    assert_eq!(state.turn_id, original_turn_id);
+}
+
+#[test]
+fn error_result_without_content_still_emits_turn_completed() {
+    let mut state = make_state();
+    // Claude errored before sending message_start
+    state.turn_started = true;
+    state.turn_has_content = false;
+
+    let result_event = ClaudeEvent::Result(ResultEvent {
+        subtype: None,
+        result: None,
+        error: Some("API rate limited".to_string()),
+        duration_ms: None,
+        duration_api_ms: None,
+        num_turns: None,
+        is_error: true,
+        session_id: None,
+        cost_usd: None,
+        usage: None,
+        extra: Default::default(),
+    });
+
+    let events = map_event(&result_event, &mut state);
+
+    // Error result should emit turn/completed even without content
+    assert!(
+        events.iter().any(|e| e["method"] == "turn/completed"),
+        "error result must emit turn/completed"
+    );
+    assert!(
+        events.iter().any(|e| e["method"] == "error"),
+        "error result must emit error event"
+    );
+}
+
+#[test]
+fn normal_result_with_content_emits_turn_completed() {
+    let mut state = make_state();
+    state.turn_started = true;
+    state.turn_has_content = true; // Claude responded normally
+
+    let result_event = ClaudeEvent::Result(ResultEvent {
+        subtype: Some("success".to_string()),
+        result: None,
+        error: None,
+        duration_ms: Some(1000),
+        duration_api_ms: None,
+        num_turns: Some(1),
+        is_error: false,
+        session_id: None,
+        cost_usd: Some(0.02),
+        usage: None,
+        extra: Default::default(),
+    });
+
+    let events = map_event(&result_event, &mut state);
+
+    assert!(
+        events.iter().any(|e| e["method"] == "turn/completed"),
+        "normal result must emit turn/completed"
+    );
+    // new_turn() was called → turn_started is false
+    assert!(!state.turn_started);
+}
+
+#[test]
+fn message_start_sets_turn_has_content() {
+    let mut state = make_state();
+    assert!(!state.turn_has_content);
+
+    let event = ClaudeEvent::MessageStart(MessageStartEvent { message: None });
+    let _ = map_event(&event, &mut state);
+
+    assert!(state.turn_has_content);
 }
