@@ -161,6 +161,8 @@ Use extra care in high-churn/high-complexity files:
 - `src-tauri/src/shared/git_ui_core.rs`
 - `src-tauri/src/shared/workspaces_core.rs`
 - `src-tauri/src/bin/codex_monitor_daemon/rpc.rs`
+- `src-tauri/src/claude_bridge/process.rs`
+- `src-tauri/src/claude_bridge/event_mapper.rs`
 
 ## Canonical References
 

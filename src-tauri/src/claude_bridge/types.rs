@@ -367,8 +367,9 @@ impl BridgeState {
         self.block_tool_use_ids.clear();
         self.last_assistant_msg_id.clear();
         self.last_assistant_block_count = 0;
+        self.accumulated_text.clear();
         // NOTE: pending_control_requests, approval_id_counter,
-        // claude_session_id are preserved across turns.
+        // claude_session_id, thread_named are preserved across turns.
     }
 }
 
@@ -785,7 +786,8 @@ mod tests {
         assert_eq!(state.total_input_tokens, 100);
         assert_eq!(state.total_output_tokens, 50);
         assert!((state.total_cost_usd - 0.05).abs() < f64::EPSILON);
-        assert_eq!(state.accumulated_text, "some text");
+        // accumulated_text is cleared per-turn (thread name is extracted before new_turn)
+        assert!(state.accumulated_text.is_empty());
         assert_eq!(state.model.as_deref(), Some("claude-sonnet-4-20250514"));
         assert!(state.thread_started);
         assert_eq!(state.next_item_id, 3);
@@ -833,5 +835,73 @@ mod tests {
             }
             _ => panic!("Expected ControlRequest event"),
         }
+    }
+
+    // ── StreamEvent / RateLimitEvent deserialization ──────────────
+
+    #[test]
+    fn deserialize_stream_event_wrapper() {
+        let json_str = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json_str).unwrap();
+        match event {
+            ClaudeEvent::StreamEvent(wrapper) => {
+                let inner = wrapper.event.unwrap();
+                assert_eq!(inner["type"], "content_block_delta");
+                assert_eq!(inner["delta"]["text"], "hi");
+            }
+            _ => panic!("Expected StreamEvent"),
+        }
+    }
+
+    #[test]
+    fn deserialize_stream_event_without_event_field() {
+        let json_str = r#"{"type":"stream_event"}"#;
+        let event: ClaudeEvent = serde_json::from_str(json_str).unwrap();
+        match event {
+            ClaudeEvent::StreamEvent(wrapper) => {
+                assert!(wrapper.event.is_none());
+            }
+            _ => panic!("Expected StreamEvent"),
+        }
+    }
+
+    #[test]
+    fn deserialize_rate_limit_event() {
+        let json_str = r#"{"type":"rate_limit_event","limit":100,"remaining":95,"reset_at":"2026-03-18T12:00:00Z"}"#;
+        let event: ClaudeEvent = serde_json::from_str(json_str).unwrap();
+        assert!(matches!(event, ClaudeEvent::RateLimitEvent(_)));
+    }
+
+    // ── BridgeState: new_turn_with_id and turn_has_content ───────
+
+    #[test]
+    fn bridge_state_new_turn_with_id_uses_provided_id() {
+        let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_init".to_string());
+        state.turn_started = true;
+        state.turn_has_content = true;
+        state.block_items.insert(0, "item_1".to_string());
+        state.accumulated_text = "some text".to_string();
+
+        state.new_turn_with_id("turn_explicit_42".to_string());
+
+        assert_eq!(state.turn_id, "turn_explicit_42");
+        assert!(!state.turn_started);
+        assert!(!state.turn_has_content);
+        assert!(state.block_items.is_empty());
+        assert!(state.accumulated_text.is_empty());
+    }
+
+    #[test]
+    fn bridge_state_new_turn_clears_accumulated_text() {
+        let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_1".to_string());
+        state.accumulated_text = "Hello world from turn 1".to_string();
+        state.thread_named = true;
+
+        state.new_turn();
+
+        // accumulated_text cleared since thread is already named
+        assert!(state.accumulated_text.is_empty());
+        // thread_named preserved across turns
+        assert!(state.thread_named);
     }
 }

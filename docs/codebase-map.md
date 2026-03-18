@@ -27,6 +27,7 @@ If a behavior must work in both app and daemon, implement it in `src-tauri/src/s
 | Need | Primary files to edit |
 | --- | --- |
 | App-level UI composition/layout wiring | `src/App.tsx`, `src/features/app/components/AppLayout.tsx`, `src/features/app/bootstrap/*`, `src/features/app/orchestration/*`, `src/features/app/hooks/*` |
+| Change Claude CLI bridge behavior | `src-tauri/src/claude_bridge/process.rs` (spawn, interceptor), `src-tauri/src/claude_bridge/event_mapper.rs` (event translation), `src-tauri/src/claude_bridge/item_tracker.rs` (tool classification), `src-tauri/src/claude_bridge/history.rs` (session loading), `src-tauri/src/claude_bridge/types.rs` (ClaudeEvent, BridgeState) |
 | Add/change Tauri IPC methods used by frontend | `src/services/tauri.ts`, `src-tauri/src/lib.rs`, matching backend adapter module |
 | Add/change app-server event handling in UI | `src/services/events.ts`, `src/features/app/hooks/useAppServerEvents.ts`, `src/utils/appServerEvents.ts`, `src/features/threads/utils/threadNormalize.ts` |
 | Change thread state transitions | `src/features/threads/hooks/useThreadsReducer.ts`, `src/features/threads/hooks/threadReducer/*`, `src/features/threads/hooks/useThreads.ts`, focused thread hooks under `src/features/threads/hooks/*` |
@@ -99,6 +100,7 @@ Use TS/Vite aliases for refactor-safe imports:
 - Settings adapters: `src-tauri/src/settings/mod.rs`
 - Prompts adapters: `src-tauri/src/prompts.rs`
 - File adapters: `src-tauri/src/files/mod.rs`
+- Claude CLI bridge: `src-tauri/src/claude_bridge/*` (process, event mapping, item tracking, history, types)
 - Event emission implementation: `src-tauri/src/event_sink.rs`
 - Event payload definitions: `src-tauri/src/backend/events.rs`
 
