@@ -86,8 +86,34 @@ pub(crate) fn extract_command(tool_name: &str, input: &Value) -> Option<String> 
             let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("?");
             Some(format!("WebSearch: {query}"))
         }
-        _ => None,
+        _ => infer_command_from_input(tool_name, input),
     }
+}
+
+/// Heuristic fallback: infer a command description from input fields
+/// when the tool name is not recognized (e.g. MCP tools, new CLI tools).
+fn infer_command_from_input(tool_name: &str, input: &Value) -> Option<String> {
+    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+        return Some(cmd.to_string());
+    }
+    if let Some(path) = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(format!("{tool_name}: {path}"));
+    }
+    if let Some(q) = input
+        .get("query")
+        .or_else(|| input.get("pattern"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(format!("{tool_name}: {q}"));
+    }
+    if let Some(url) = input.get("url").and_then(|v| v.as_str()) {
+        return Some(format!("{tool_name}: {url}"));
+    }
+    None
 }
 
 /// Extract a file path from the parsed tool input JSON.
@@ -112,6 +138,26 @@ pub(crate) fn infer_change_kind(tool_name: &str) -> &'static str {
         "edit_file" | "Edit" | "str_replace_editor" | "NotebookEdit" => "modify",
         _ => "modify",
     }
+}
+
+/// Heuristic: infer tool category from input fields when tool name is unknown.
+/// A tool with `path`/`file_path` + `content`/`old_string`/`new_string` is
+/// likely a file change.  One with `command` is likely a shell execution.
+fn infer_category_from_input(input: &Value) -> ToolCategory {
+    let has_path = input.get("file_path").is_some() || input.get("path").is_some();
+    let has_content = input.get("content").is_some()
+        || input.get("old_string").is_some()
+        || input.get("new_string").is_some()
+        || input.get("old_str").is_some()
+        || input.get("new_str").is_some();
+
+    if has_path && has_content {
+        return ToolCategory::FileChange;
+    }
+    if input.get("command").is_some() {
+        return ToolCategory::CommandExecution;
+    }
+    ToolCategory::Other
 }
 
 /// Build the `item` object for an `item/started` event.
@@ -155,15 +201,24 @@ pub(crate) fn build_item_completed(
     let parsed_input: Value = serde_json::from_str(&info.accumulated_input_json)
         .unwrap_or(Value::Null);
 
+    // For unknown tools, reclassify based on input fields now that we have
+    // the full input.  A tool with path + content/old_string is likely a
+    // file change; otherwise keep the original category.
+    let effective_category = if info.category == ToolCategory::Other {
+        infer_category_from_input(&parsed_input)
+    } else {
+        info.category
+    };
+
     let mut item = json!({
         "id": info.item_id,
-        "type": info.category.item_type(),
+        "type": effective_category.item_type(),
         "status": "completed",
         "toolName": info.tool_name,
         "toolUseId": info.tool_use_id,
     });
 
-    match info.category {
+    match effective_category {
         ToolCategory::CommandExecution | ToolCategory::FileRead | ToolCategory::Other => {
             if let Some(cmd) = extract_command(&info.tool_name, &parsed_input) {
                 item["command"] = json!(cmd);
@@ -175,6 +230,14 @@ pub(crate) fn build_item_completed(
         }
         ToolCategory::FileChange => {
             let path = extract_file_path(&info.tool_name, &parsed_input)
+                .or_else(|| {
+                    // Generic fallback for reclassified tools.
+                    parsed_input
+                        .get("path")
+                        .or_else(|| parsed_input.get("file_path"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_default();
             let kind = infer_change_kind(&info.tool_name);
 
@@ -298,9 +361,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_command_returns_none_for_non_command_tool() {
+    fn extract_command_known_file_tool_ignores_command_field() {
+        // write_file is a known file-change tool — extract_command doesn't
+        // match it, but the heuristic fallback picks up the "command" field.
         let input = json!({"command": "something"});
-        assert_eq!(extract_command("write_file", &input), None);
+        assert_eq!(extract_command("write_file", &input), Some("something".to_string()));
     }
 
     #[test]
@@ -346,8 +411,77 @@ mod tests {
     }
 
     #[test]
-    fn extract_command_unknown_tool_returns_none() {
+    fn extract_command_unknown_tool_empty_input_returns_none() {
         assert_eq!(extract_command("CustomTool", &json!({})), None);
+    }
+
+    #[test]
+    fn extract_command_unknown_tool_with_command_field() {
+        let input = json!({"command": "do-something --flag"});
+        assert_eq!(
+            extract_command("mcp__custom__run", &input),
+            Some("do-something --flag".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_command_unknown_tool_with_path_field() {
+        let input = json!({"file_path": "/tmp/data.csv", "format": "csv"});
+        assert_eq!(
+            extract_command("mcp__data__process", &input),
+            Some("mcp__data__process: /tmp/data.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_command_unknown_tool_with_query_field() {
+        let input = json!({"query": "SELECT * FROM users"});
+        assert_eq!(
+            extract_command("mcp__db__query", &input),
+            Some("mcp__db__query: SELECT * FROM users".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_command_unknown_tool_with_url_field() {
+        let input = json!({"url": "https://api.example.com/data"});
+        assert_eq!(
+            extract_command("mcp__api__fetch", &input),
+            Some("mcp__api__fetch: https://api.example.com/data".to_string())
+        );
+    }
+
+    // ── infer_category_from_input ────────────────────────────────
+
+    #[test]
+    fn infer_category_file_change_from_path_and_content() {
+        let input = json!({"path": "/tmp/file.rs", "content": "fn main() {}"});
+        assert_eq!(infer_category_from_input(&input), ToolCategory::FileChange);
+    }
+
+    #[test]
+    fn infer_category_file_change_from_old_new_string() {
+        let input = json!({"file_path": "/tmp/file.rs", "old_string": "a", "new_string": "b"});
+        assert_eq!(infer_category_from_input(&input), ToolCategory::FileChange);
+    }
+
+    #[test]
+    fn infer_category_command_from_command_field() {
+        let input = json!({"command": "ls -la"});
+        assert_eq!(infer_category_from_input(&input), ToolCategory::CommandExecution);
+    }
+
+    #[test]
+    fn infer_category_other_for_unknown_fields() {
+        let input = json!({"message": "hello", "channel": "#general"});
+        assert_eq!(infer_category_from_input(&input), ToolCategory::Other);
+    }
+
+    #[test]
+    fn infer_category_path_only_without_content_stays_other() {
+        // path alone (without content) could be a read, not a change
+        let input = json!({"path": "/tmp/file.rs"});
+        assert_eq!(infer_category_from_input(&input), ToolCategory::Other);
     }
 
     // ── extract_file_path ────────────────────────────────────────
@@ -487,6 +621,42 @@ mod tests {
         let changes = event["params"]["item"]["changes"].as_array().unwrap();
         assert_eq!(changes[0]["kind"], "modify");
         assert!(changes[0]["diff"].as_str().unwrap().contains("--- a/src/lib.rs"));
+    }
+
+    #[test]
+    fn build_item_completed_reclassifies_unknown_tool_as_file_change() {
+        let info = ItemInfo {
+            item_id: "item_rc".into(),
+            tool_use_id: "toolu_rc".into(),
+            tool_name: "mcp__editor__save".into(),
+            category: ToolCategory::Other, // initially classified as Other
+            accumulated_input_json: r#"{"path": "/tmp/test.txt", "content": "hello"}"#.into(),
+            aggregated_output: String::new(),
+        };
+        let event = build_item_completed(&info, "t1", "turn1");
+        let item = &event["params"]["item"];
+        // Reclassified to fileChange based on path + content in input
+        assert_eq!(item["type"], "fileChange");
+        let changes = item["changes"].as_array().unwrap();
+        assert_eq!(changes[0]["path"], "/tmp/test.txt");
+        assert_eq!(changes[0]["kind"], "modify");
+    }
+
+    #[test]
+    fn build_item_completed_unknown_tool_with_command_stays_command() {
+        let info = ItemInfo {
+            item_id: "item_cmd".into(),
+            tool_use_id: "toolu_cmd".into(),
+            tool_name: "mcp__shell__exec".into(),
+            category: ToolCategory::Other,
+            accumulated_input_json: r#"{"command": "echo hello"}"#.into(),
+            aggregated_output: "hello\n".into(),
+        };
+        let event = build_item_completed(&info, "t1", "turn1");
+        let item = &event["params"]["item"];
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["command"], "echo hello");
+        assert_eq!(item["aggregatedOutput"], "hello\n");
     }
 
     // ── build_output_delta ───────────────────────────────────────
