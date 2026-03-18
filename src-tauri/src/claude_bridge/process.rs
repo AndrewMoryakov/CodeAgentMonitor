@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::backend::app_server::{InterceptAction, WorkspaceSession};
 use crate::backend::events::{AppServerEvent, EventSink};
@@ -15,24 +15,14 @@ use super::event_mapper;
 use super::history::{discover_models, read_claude_sessions, read_session_items, ClaudeSession};
 use super::types::BridgeState;
 
-/// A prompt turn to be processed by the coordinator task.
-struct TurnRequest {
-    prompt: String,
-    /// The thread ID from `turn/start` params (may be a historical session UUID).
-    thread_id: String,
-    turn_id: String,
-    /// Model override from the UI dropdown (e.g. "claude-opus-4-6").
-    model: Option<String>,
-}
-
-/// How to identify the conversation session when spawning `claude --print`.
-enum SessionArg {
-    /// First turn of a brand-new conversation — no session flags.
-    New,
-    /// Continue the most-recent session in the working directory.
-    Continue,
-    /// Resume a specific session by UUID.
-    Resume(String),
+/// Messages sent to the stdin writer task.
+enum StdinMessage {
+    /// A new user prompt for a conversation turn.
+    UserMessage { text: String, uuid: String },
+    /// A pre-serialized NDJSON line (control_response).
+    ControlResponse(String),
+    /// Interrupt the current turn.
+    Interrupt,
 }
 
 /// Check that the `claude` CLI binary is available.
@@ -52,15 +42,14 @@ pub(crate) async fn check_claude_installation() -> Result<String, String> {
     Ok(version)
 }
 
-/// Spawn a Claude CLI session that presents the same `WorkspaceSession`
+/// Spawn a persistent Claude CLI session that presents the same `WorkspaceSession`
 /// interface as the Codex backend. The bridge translates between the
-/// Codex JSON-RPC protocol and Claude CLI's stream-json format.
+/// Codex JSON-RPC protocol and Claude CLI's bidirectional stream-json format.
 ///
-/// Architecture: **spawn-per-turn**. Each `turn/start` / `turn/steer` message
-/// spawns a fresh `claude --print --output-format stream-json` process.
-/// Historical sessions are loaded from `~/.claude/projects/<encoded-path>/`
-/// and surfaced in `thread/list`. Selecting a historical thread passes
-/// `--resume <session-id>` so Claude resumes the exact conversation.
+/// Architecture: **persistent process**. One `claude --print --input-format stream-json`
+/// process lives for the entire session. User messages, control responses, and
+/// interrupts are sent via an mpsc channel to a dedicated stdin writer task.
+/// A stdout reader task parses NDJSON events and emits Codex-compatible events.
 pub(crate) async fn spawn_claude_session<E: EventSink>(
     entry: WorkspaceEntry,
     _client_version: String,
@@ -72,27 +61,91 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let workspace_id = entry.id.clone();
     let workspace_path = entry.path.clone();
 
-    // Channel: interceptor (sync) → coordinator task (async)
-    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<TurnRequest>();
-
-    // Shared session history: loaded at startup, refreshed after each turn.
+    // Shared session history: loaded at startup.
     let sessions: Arc<std::sync::Mutex<Vec<ClaudeSession>>> = Arc::new(
         std::sync::Mutex::new(read_claude_sessions(&workspace_path)),
     );
 
-    // Maps thread_id → resolved session_id (populated after first new-conv turn).
-    let thread_session_map: Arc<std::sync::Mutex<HashMap<String, String>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-    // Shared detected model: updated by coordinator, read by interceptor.
+    // Shared detected model: updated by stdout reader, read by interceptor.
     let detected_model: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let active_interrupts: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<()>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // Shared bridge state (protected by std::sync::Mutex for sync interceptor access).
+    let bridge_state: Arc<std::sync::Mutex<BridgeState>> = Arc::new(
+        std::sync::Mutex::new(BridgeState::new(
+            workspace_id.clone(),
+            thread_id.clone(),
+            format!("turn_{}", uuid::Uuid::new_v4()),
+        )),
+    );
+
+    // Channel: interceptor → stdin writer task
+    let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinMessage>();
+
+    // Spawn the persistent Claude CLI process.
+    let mut child = Command::new("claude")
+        .args([
+            "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(&workspace_path)
+        .env_remove("CLAUDECODE")
+        .spawn()
+        .map_err(|e| format!("Failed to spawn claude: {e}"))?;
+
+    let child_stdin = child.stdin.take().ok_or("missing claude stdin")?;
+    let child_stdout = child.stdout.take().ok_or("missing claude stdout")?;
+    let child_stderr = child.stderr.take();
+
+    // Spawn stdin writer task (sole owner of ChildStdin).
+    tokio::spawn(stdin_writer_task(child_stdin, stdin_rx));
+
+    // Spawn stderr reader task.
+    let stderr_event_sink = event_sink.clone();
+    let stderr_ws_id = workspace_id.clone();
+    tokio::spawn(async move {
+        if let Some(stderr) = child_stderr {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                stderr_event_sink.emit_app_server_event(AppServerEvent {
+                    workspace_id: stderr_ws_id.clone(),
+                    message: json!({
+                        "method": "codex/stderr",
+                        "params": { "message": line }
+                    }),
+                });
+            }
+        }
+    });
+
+    // Spawn stdout reader task.
+    let stdout_bridge_state = bridge_state.clone();
+    let stdout_event_sink = event_sink.clone();
+    let stdout_ws_id = workspace_id.clone();
+    let stdout_detected_model = detected_model.clone();
+    let stdout_sessions = sessions.clone();
+    let stdout_workspace_path = workspace_path.clone();
+    tokio::spawn(stdout_reader_task(
+        child_stdout,
+        stdout_bridge_state,
+        stdout_event_sink,
+        stdout_ws_id,
+        stdout_detected_model,
+        stdout_sessions,
+        stdout_workspace_path,
+    ));
 
     // Spawn a dummy child process to satisfy WorkspaceSession's type requirements.
-    // The dummy's stdin is never written to — all actual work is done per-turn
-    // by the coordinator task below.
     let mut dummy_child = Command::new("cmd")
         .args(["/c", "exit", "0"])
         .stdin(std::process::Stdio::piped())
@@ -103,19 +156,37 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     let dummy_stdin = dummy_child.stdin.take().ok_or("missing dummy stdin")?;
 
     // Build the request interceptor.
-    // turn/start and turn/steer are short-circuited: prompt+threadId go to
-    // the coordinator via channel, an immediate ack is returned to the caller.
     let interceptor_thread_id = thread_id.clone();
     let interceptor_workspace_id = workspace_id.clone();
     let interceptor_workspace_path = workspace_path.clone();
+    let interceptor_event_sink = event_sink.clone();
     let detected_model_for_interceptor = detected_model.clone();
     let sessions_for_interceptor = sessions.clone();
-    let active_interrupts_for_interceptor = active_interrupts.clone();
+    let interceptor_bridge_state = bridge_state.clone();
+    let interceptor_stdin_tx = stdin_tx.clone();
+
     let interceptor: Arc<dyn Fn(Value) -> InterceptAction + Send + Sync> =
         Arc::new(move |value: Value| {
             let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let id = value.get("id").cloned();
             let params = value.get("params").cloned().unwrap_or(Value::Null);
+
+            // ── Handle response messages (approval/userInput answers) ──
+            if value.get("result").is_some() && method.is_empty() {
+                if let Some(resp_id) = value.get("id").and_then(|v| v.as_u64()) {
+                    let mut bs = interceptor_bridge_state.lock().unwrap();
+                    if let Some(pending) = bs.pending_control_requests.remove(&resp_id) {
+                        let result_val = value.get("result").cloned().unwrap_or(Value::Null);
+                        let ndjson = build_control_response(&pending, &result_val);
+                        let _ = interceptor_stdin_tx.send(StdinMessage::ControlResponse(ndjson));
+                        return InterceptAction::Respond(json!({
+                            "id": resp_id,
+                            "result": {"ok": true}
+                        }));
+                    }
+                }
+                return InterceptAction::Drop;
+            }
 
             match method {
                 "turn/start" | "turn/steer" => {
@@ -135,17 +206,43 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                         .and_then(|v| v.as_str())
                         .unwrap_or(&interceptor_thread_id)
                         .to_string();
-                    let model = params
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
                     let turn_id = format!("turn_{}", uuid::Uuid::new_v4());
-                    let _ = prompt_tx.send(TurnRequest {
-                        prompt: text,
-                        thread_id: tid.clone(),
-                        turn_id: turn_id.clone(),
-                        model,
+                    let uuid = uuid::Uuid::new_v4().to_string();
+
+                    // Reset bridge state for new turn
+                    {
+                        let mut bs = interceptor_bridge_state.lock().unwrap();
+                        bs.thread_id = tid.clone();
+                        bs.new_turn();
+                        // Override the turn_id generated by new_turn()
+                        bs.turn_id = turn_id.clone();
+                    }
+
+                    // Emit user message so it appears in the thread
+                    let user_item_id = format!("user_{turn_id}");
+                    interceptor_event_sink.emit_app_server_event(AppServerEvent {
+                        workspace_id: interceptor_workspace_id.clone(),
+                        message: json!({
+                            "method": "item/started",
+                            "params": {
+                                "threadId": &tid,
+                                "item": {
+                                    "id": user_item_id,
+                                    "type": "userMessage",
+                                    "content": [
+                                        { "type": "text", "text": &text }
+                                    ]
+                                }
+                            }
+                        }),
                     });
+
+                    // Send user message to the persistent process via channel
+                    let _ = interceptor_stdin_tx.send(StdinMessage::UserMessage {
+                        text,
+                        uuid,
+                    });
+
                     if let Some(id) = id {
                         InterceptAction::Respond(json!({
                             "id": id,
@@ -162,18 +259,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                 }
 
                 "turn/interrupt" => {
-                    let tid = params
-                        .get("threadId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&interceptor_thread_id)
-                        .to_string();
-                    if let Some(sender) = active_interrupts_for_interceptor
-                        .lock()
-                        .unwrap()
-                        .remove(&tid)
-                    {
-                        let _ = sender.send(());
-                    }
+                    let _ = interceptor_stdin_tx.send(StdinMessage::Interrupt);
                     if let Some(id) = id {
                         InterceptAction::Respond(json!({
                             "id": id,
@@ -232,7 +318,6 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                             .get("threadId")
                             .and_then(|v| v.as_str())
                             .unwrap_or(&interceptor_thread_id);
-                        // Look up the session name for historical threads.
                         let session_name = sessions_for_interceptor
                             .lock()
                             .ok()
@@ -240,7 +325,6 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                                 sessions.iter().find(|s| s.session_id == tid).map(|s| s.name.clone())
                             });
                         let preview = session_name.unwrap_or_else(|| "New conversation".to_string());
-                        // Load conversation items from the JSONL session file.
                         let items = read_session_items(&interceptor_workspace_path, tid);
                         let turns = if items.is_empty() {
                             json!([])
@@ -303,79 +387,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
         request_interceptor: Some(interceptor),
     });
 
-    // Coordinator task: one `claude --print` process per turn.
-    let coord_workspace_id = workspace_id.clone();
-    let coord_workspace_path = workspace_path.clone();
-    let coord_thread_id = thread_id.clone();
-    let coord_event_sink = event_sink.clone();
-    let coord_detected_model = detected_model.clone();
-    let coord_sessions = sessions.clone();
-    let coord_thread_session_map = thread_session_map.clone();
-    let coord_active_interrupts = active_interrupts.clone();
-    tokio::spawn(async move {
-        // Persist thread_started across turns so thread/started is only emitted once.
-        let mut thread_started = false;
-        while let Some(request) = prompt_rx.recv().await {
-            let session_arg = {
-                let map = coord_thread_session_map.lock().unwrap();
-                match map.get(&request.thread_id) {
-                    Some(sid) => SessionArg::Resume(sid.clone()),
-                    None => {
-                        if request.thread_id == coord_thread_id {
-                            SessionArg::New
-                        } else {
-                            SessionArg::Resume(request.thread_id.clone())
-                        }
-                    }
-                }
-            };
-
-            let (interrupt_tx, interrupt_rx) = oneshot::channel();
-            coord_active_interrupts
-                .lock()
-                .unwrap()
-                .insert(request.thread_id.clone(), interrupt_tx);
-
-            run_claude_turn(
-                &request.prompt,
-                &coord_workspace_path,
-                &coord_workspace_id,
-                &request.thread_id,
-                &request.turn_id,
-                session_arg,
-                request.model.as_deref(),
-                &mut thread_started,
-                interrupt_rx,
-                &coord_event_sink,
-                &coord_detected_model,
-            )
-            .await;
-
-            coord_active_interrupts
-                .lock()
-                .unwrap()
-                .remove(&request.thread_id);
-
-            if !coord_thread_session_map
-                .lock()
-                .unwrap()
-                .contains_key(&request.thread_id)
-                && request.thread_id == coord_thread_id
-            {
-                let fresh = read_claude_sessions(&coord_workspace_path);
-                if let Some(newest) = fresh.first() {
-                    coord_thread_session_map
-                        .lock()
-                        .unwrap()
-                        .insert(request.thread_id.clone(), newest.session_id.clone());
-                }
-            }
-
-            *coord_sessions.lock().unwrap() = read_claude_sessions(&coord_workspace_path);
-        }
-    });
-
-    // Emit codex/connected immediately so the UI knows the session is ready
+    // Emit codex/connected immediately so the UI knows the session is ready.
     event_sink.emit_app_server_event(AppServerEvent {
         workspace_id: workspace_id.clone(),
         message: json!({
@@ -387,161 +399,81 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     Ok(session)
 }
 
-/// Run a single claude turn: spawn `claude --print --output-format stream-json`,
-/// deliver the prompt via stdin (EOF signals end of input), stream events back
-/// via `event_sink`, then wait for the process to exit.
-async fn run_claude_turn<E: EventSink>(
-    prompt: &str,
-    workspace_path: &str,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    session_arg: SessionArg,
-    model: Option<&str>,
-    thread_started: &mut bool,
-    mut interrupt_rx: oneshot::Receiver<()>,
-    event_sink: &E,
-    detected_model: &Arc<std::sync::Mutex<Option<String>>>,
+/// Stdin writer task: sole owner of ChildStdin. Receives messages via channel
+/// and writes them as NDJSON lines.
+async fn stdin_writer_task(
+    mut stdin: tokio::process::ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<StdinMessage>,
 ) {
-    let mut command = Command::new("claude");
-    command.args([
-        "--output-format", "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--print",
-    ]);
-    if let Some(m) = model {
-        command.args(["--model", m]);
-    }
-    match &session_arg {
-        SessionArg::New => {}
-        SessionArg::Continue => {
-            command.arg("--continue");
+    while let Some(msg) = rx.recv().await {
+        let line = match msg {
+            StdinMessage::UserMessage { text, uuid } => build_user_message(&text, &uuid),
+            StdinMessage::ControlResponse(ndjson) => ndjson,
+            StdinMessage::Interrupt => build_interrupt_request(),
+        };
+        if stdin.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+            break;
         }
-        SessionArg::Resume(sid) => {
-            command.args(["--resume", sid]);
+        if stdin.flush().await.is_err() {
+            break;
         }
     }
-    command.current_dir(workspace_path);
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    // Remove the env var that blocks nested Claude CLI sessions
-    command.env_remove("CLAUDECODE");
+}
 
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            event_sink.emit_app_server_event(AppServerEvent {
-                workspace_id: workspace_id.to_string(),
-                message: json!({
-                    "method": "error",
-                    "params": {
-                        "threadId": thread_id,
-                        "turnId": turn_id,
-                        "willRetry": false,
-                        "error": { "message": format!("Failed to spawn claude: {e}") }
-                    }
-                }),
-            });
-            return;
+/// Stdout reader task: reads NDJSON lines, parses as ClaudeEvent, maps to
+/// Codex events, and emits them via event_sink.
+async fn stdout_reader_task<E: EventSink>(
+    stdout: tokio::process::ChildStdout,
+    bridge_state: Arc<std::sync::Mutex<BridgeState>>,
+    event_sink: E,
+    workspace_id: String,
+    detected_model: Arc<std::sync::Mutex<Option<String>>>,
+    sessions: Arc<std::sync::Mutex<Vec<ClaudeSession>>>,
+    workspace_path: String,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
         }
-    };
 
-    // Write prompt to stdin and close it (EOF causes claude to start processing)
-    if let Some(mut stdin_handle) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin_handle.write_all(prompt.as_bytes()).await;
-        let _ = stdin_handle.write_all(b"\n").await;
-        // stdin_handle dropped here → EOF
-    }
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    // Read stderr concurrently in a spawned task
-    let stderr_event_sink = event_sink.clone();
-    let stderr_ws_id = workspace_id.to_string();
-    let stderr_task = tokio::spawn(async move {
-        if let Some(stderr) = stderr {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                stderr_event_sink.emit_app_server_event(AppServerEvent {
-                    workspace_id: stderr_ws_id.clone(),
+        let claude_event: super::types::ClaudeEvent = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(err) => {
+                let bs = bridge_state.lock().unwrap();
+                event_sink.emit_app_server_event(AppServerEvent {
+                    workspace_id: workspace_id.clone(),
                     message: json!({
-                        "method": "codex/stderr",
-                        "params": { "message": line }
+                        "method": "error",
+                        "params": {
+                            "threadId": bs.thread_id,
+                            "turnId": bs.turn_id,
+                            "willRetry": false,
+                            "error": {
+                                "message": format!("Failed to parse Claude stream event: {err}")
+                            }
+                        }
                     }),
                 });
-            }
-        }
-    });
-
-    // Read stdout (stream-json events) in the current task
-    let mut bridge_state = BridgeState::new(
-        workspace_id.to_string(),
-        thread_id.to_string(),
-        turn_id.to_string(),
-    );
-    bridge_state.thread_started = *thread_started;
-    let mut turn_completed = false;
-    if let Some(stdout) = stdout {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let next_line = tokio::select! {
-                _ = &mut interrupt_rx => {
-                    let _ = child.start_kill();
-                    event_sink.emit_app_server_event(AppServerEvent {
-                        workspace_id: workspace_id.to_string(),
-                        message: json!({
-                            "method": "thread/status/changed",
-                            "params": {
-                                "threadId": thread_id,
-                                "status": { "type": "idle" }
-                            }
-                        }),
-                    });
-                    turn_completed = true; // interrupt handled, no synthetic completion needed
-                    break;
-                }
-                result = lines.next_line() => result,
-            };
-            let next_line: Result<Option<String>, _> = next_line;
-            let Ok(Some(line)) = next_line else {
-                break;
-            };
-            if line.trim().is_empty() {
                 continue;
             }
-            let claude_event: super::types::ClaudeEvent = match serde_json::from_str(&line) {
-                Ok(e) => e,
-                Err(err) => {
-                    event_sink.emit_app_server_event(AppServerEvent {
-                        workspace_id: workspace_id.to_string(),
-                        message: json!({
-                            "method": "error",
-                            "params": {
-                                "threadId": thread_id,
-                                "turnId": turn_id,
-                                "willRetry": false,
-                                "error": {
-                                    "message": format!("Failed to parse Claude stream event: {err}")
-                                }
-                            }
-                        }),
-                    });
-                    continue;
-                }
-            };
+        };
 
-            let codex_messages = event_mapper::map_event(&claude_event, &mut bridge_state);
+        let codex_messages = {
+            let mut bs = bridge_state.lock().unwrap();
+
+            // Capture session_id from system init
+            if let super::types::ClaudeEvent::System(ref sys) = claude_event {
+                if let Some(ref sid) = sys.session_id {
+                    bs.claude_session_id = Some(sid.clone());
+                }
+            }
+
+            let messages = event_mapper::map_event(&claude_event, &mut bs);
 
             // Propagate detected model to interceptor
-            if let Some(ref model) = bridge_state.model {
+            if let Some(ref model) = bs.model {
                 if let Ok(mut guard) = detected_model.lock() {
                     if guard.as_ref() != Some(model) {
                         *guard = Some(model.clone());
@@ -549,45 +481,159 @@ async fn run_claude_turn<E: EventSink>(
                 }
             }
 
-            for message in codex_messages {
-                if message.get("method").and_then(|v| v.as_str()) == Some("turn/completed") {
-                    turn_completed = true;
-                }
-                event_sink.emit_app_server_event(AppServerEvent {
-                    workspace_id: workspace_id.to_string(),
-                    message,
-                });
+            messages
+        };
+
+        for message in &codex_messages {
+            event_sink.emit_app_server_event(AppServerEvent {
+                workspace_id: workspace_id.clone(),
+                message: message.clone(),
+            });
+        }
+
+        // After a result event, refresh session history
+        if matches!(claude_event, super::types::ClaudeEvent::Result(_)) {
+            if let Ok(mut sess) = sessions.lock() {
+                *sess = read_claude_sessions(&workspace_path);
             }
         }
     }
 
-    // Persist thread_started for next turn.
-    *thread_started = bridge_state.thread_started;
-
-    // If the turn was started but never completed (crash/EOF), emit a
-    // synthetic turn/completed so the UI exits "processing" state.
-    if bridge_state.turn_started && !turn_completed {
+    // Process exited — if a turn was in progress, emit synthetic turn/completed.
+    let bs = bridge_state.lock().unwrap();
+    if bs.turn_started {
         event_sink.emit_app_server_event(AppServerEvent {
-            workspace_id: workspace_id.to_string(),
+            workspace_id: workspace_id.clone(),
             message: json!({
                 "method": "turn/completed",
                 "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
+                    "threadId": bs.thread_id,
+                    "turnId": bs.turn_id,
                     "status": "error"
                 }
             }),
         });
     }
 
-    let _ = stderr_task.await;
-    let _ = child.wait().await;
+    // Emit idle status
+    event_sink.emit_app_server_event(AppServerEvent {
+        workspace_id,
+        message: json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": bs.thread_id,
+                "status": { "type": "idle" }
+            }
+        }),
+    });
+}
+
+/// Build a Claude NDJSON user message.
+fn build_user_message(text: &str, uuid: &str) -> String {
+    let msg = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": text
+        },
+        "uuid": uuid,
+        "parent_tool_use_id": null,
+        "session_id": ""
+    });
+    serde_json::to_string(&msg).unwrap_or_default()
+}
+
+/// Build a Claude NDJSON interrupt control_request.
+fn build_interrupt_request() -> String {
+    let msg = json!({
+        "type": "control_request",
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "request": {
+            "subtype": "interrupt"
+        }
+    });
+    serde_json::to_string(&msg).unwrap_or_default()
+}
+
+/// Build a Claude NDJSON control_response for a pending control request.
+fn build_control_response(
+    pending: &super::types::PendingControlRequest,
+    result: &Value,
+) -> String {
+    let msg = if pending.tool_name == "AskUserQuestion" {
+        build_ask_user_response(pending, result)
+    } else {
+        build_tool_approval_response(pending, result)
+    };
+    serde_json::to_string(&msg).unwrap_or_default()
+}
+
+/// Build control_response for tool approval (allow/deny).
+fn build_tool_approval_response(
+    pending: &super::types::PendingControlRequest,
+    result: &Value,
+) -> Value {
+    // Check if the result indicates denial
+    let denied = result.get("denied").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if denied {
+        let message = result.get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("User denied this action");
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": pending.claude_request_id,
+                "response": {
+                    "behavior": "deny",
+                    "message": message
+                }
+            }
+        })
+    } else {
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": pending.claude_request_id,
+                "response": {
+                    "behavior": "allow",
+                    "updatedInput": null
+                }
+            }
+        })
+    }
+}
+
+/// Build control_response for AskUserQuestion.
+fn build_ask_user_response(
+    pending: &super::types::PendingControlRequest,
+    result: &Value,
+) -> Value {
+    // The frontend sends answers in result.answers: {question: answer}
+    let answers = result.get("answers").cloned().unwrap_or(json!({}));
+
+    // Reconstruct the original input with answers merged
+    let mut updated_input = pending.request.get("input").cloned().unwrap_or(json!({}));
+    updated_input["answers"] = answers;
+
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": pending.claude_request_id,
+            "response": {
+                "behavior": "allow",
+                "updatedInput": updated_input
+            }
+        }
+    })
 }
 
 /// Format a model ID like "claude-sonnet-4-20250514" into a display name
 /// like "Claude Sonnet 4".
 fn format_model_display_name(model_id: &str) -> String {
-    // Strip date suffix (e.g. "-20250514")
     let base = if let Some(pos) = model_id.rfind('-') {
         let suffix = &model_id[pos + 1..];
         if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -598,7 +644,6 @@ fn format_model_display_name(model_id: &str) -> String {
     } else {
         model_id
     };
-    // Capitalize each segment
     base.split('-')
         .map(|s| {
             let mut c = s.chars();
@@ -627,7 +672,7 @@ fn build_claude_intercept_action(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let id = value.get("id").cloned();
-    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let _params = value.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
         "initialize" => {
@@ -1006,8 +1051,6 @@ mod tests {
         }
     }
 
-    // ── Phase 5: Additional interceptor tests ─────────────────────
-
     #[test]
     fn intercept_model_list_fallback_when_no_detected_model() {
         let action = build_claude_intercept_action(
@@ -1382,7 +1425,7 @@ mod tests {
                 "t1",
                 "w1",
                 None,
-            None,
+                None,
             );
             assert!(
                 matches!(action, InterceptAction::Drop),
@@ -1490,5 +1533,73 @@ mod tests {
             None,
         );
         assert!(matches!(action, InterceptAction::Drop));
+    }
+
+    // ── NDJSON message builders ────────────────────────────────────
+
+    #[test]
+    fn build_user_message_produces_valid_ndjson() {
+        let msg = build_user_message("Hello world", "uuid-123");
+        let parsed: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["message"]["content"], "Hello world");
+        assert_eq!(parsed["uuid"], "uuid-123");
+    }
+
+    #[test]
+    fn build_interrupt_request_produces_valid_ndjson() {
+        let msg = build_interrupt_request();
+        let parsed: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["type"], "control_request");
+        assert_eq!(parsed["request"]["subtype"], "interrupt");
+        assert!(parsed["request_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn build_tool_approval_allow() {
+        let pending = super::super::types::PendingControlRequest {
+            claude_request_id: "req_abc".to_string(),
+            tool_name: "Bash".to_string(),
+            request: json!({"subtype": "can_use_tool", "tool_name": "Bash"}),
+        };
+        let result = json!({}); // no "denied" field = allow
+        let msg = build_tool_approval_response(&pending, &result);
+        assert_eq!(msg["type"], "control_response");
+        assert_eq!(msg["response"]["request_id"], "req_abc");
+        assert_eq!(msg["response"]["response"]["behavior"], "allow");
+    }
+
+    #[test]
+    fn build_tool_approval_deny() {
+        let pending = super::super::types::PendingControlRequest {
+            claude_request_id: "req_xyz".to_string(),
+            tool_name: "Bash".to_string(),
+            request: json!({}),
+        };
+        let result = json!({"denied": true, "message": "Not safe"});
+        let msg = build_tool_approval_response(&pending, &result);
+        assert_eq!(msg["response"]["response"]["behavior"], "deny");
+        assert_eq!(msg["response"]["response"]["message"], "Not safe");
+    }
+
+    #[test]
+    fn build_ask_user_response_with_answers() {
+        let pending = super::super::types::PendingControlRequest {
+            claude_request_id: "req_q".to_string(),
+            tool_name: "AskUserQuestion".to_string(),
+            request: json!({
+                "input": {
+                    "questions": [{"question": "Which lib?"}]
+                }
+            }),
+        };
+        let result = json!({"answers": {"Which lib?": "axios"}});
+        let msg = build_ask_user_response(&pending, &result);
+        assert_eq!(msg["type"], "control_response");
+        assert_eq!(msg["response"]["response"]["behavior"], "allow");
+        assert_eq!(msg["response"]["response"]["updatedInput"]["answers"]["Which lib?"], "axios");
+        // Original questions preserved
+        assert_eq!(msg["response"]["response"]["updatedInput"]["questions"][0]["question"], "Which lib?");
     }
 }

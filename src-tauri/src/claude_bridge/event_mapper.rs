@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use super::item_tracker::{self, ItemInfo};
 use super::types::{
     BridgeState, ClaudeEvent, ContentBlock, ContentBlockDelta,
+    ControlRequestData, PendingControlRequest,
 };
 
 /// Maps a Claude CLI stream-json event to zero or more Codex JSON-RPC
@@ -21,6 +22,7 @@ pub(crate) fn map_event(event: &ClaudeEvent, state: &mut BridgeState) -> Vec<Val
         ClaudeEvent::Result(res) => map_result(res, state),
         ClaudeEvent::Assistant(a) => map_assistant(a, state),
         ClaudeEvent::StreamEvent(wrapper) => map_stream_event(wrapper, state),
+        ClaudeEvent::ControlRequest(cr) => map_control_request(cr, state),
         ClaudeEvent::RateLimitEvent(_) => vec![],
         ClaudeEvent::Unknown => vec![],
     }
@@ -525,6 +527,72 @@ fn map_result(
     out
 }
 
+/// Map a `control_request` from Claude CLI to a Codex approval or user-input event.
+fn map_control_request(
+    cr: &ControlRequestData,
+    state: &mut BridgeState,
+) -> Vec<Value> {
+    let subtype = cr.request.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    if subtype != "can_use_tool" {
+        return vec![];
+    }
+
+    let tool_name = cr.request.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let approval_id = state.next_approval_id();
+
+    state.pending_control_requests.insert(approval_id, PendingControlRequest {
+        claude_request_id: cr.request_id.clone(),
+        tool_name: tool_name.to_string(),
+        request: cr.request.clone(),
+    });
+
+    if tool_name == "AskUserQuestion" {
+        // Emit item/tool/requestUserInput for the frontend modal
+        let questions = cr.request.get("input")
+            .and_then(|i| i.get("questions"))
+            .cloned()
+            .unwrap_or(json!([]));
+        let item_id = format!("ask_{approval_id}");
+        vec![json!({
+            "id": approval_id,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": state.thread_id,
+                "turnId": state.turn_id,
+                "itemId": item_id,
+                "questions": questions
+            }
+        })]
+    } else {
+        // Emit codex/requestApproval for the frontend toast
+        let input = cr.request.get("input").cloned().unwrap_or(Value::Null);
+        let description = cr.request.get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Build command array: [tool_name, description_or_command]
+        let command_str = if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+            cmd.to_string()
+        } else {
+            description.clone()
+        };
+
+        vec![json!({
+            "id": approval_id,
+            "method": "codex/requestApproval",
+            "params": {
+                "threadId": state.thread_id,
+                "turnId": state.turn_id,
+                "command": [tool_name, &command_str],
+                "tool": tool_name,
+                "input": input,
+                "description": description
+            }
+        })]
+    }
+}
+
 fn map_assistant(
     a: &super::types::AssistantEvent,
     state: &mut BridgeState,
@@ -552,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn system_event_emits_connected_and_thread_started() {
+    fn system_event_emits_thread_started() {
         let mut state = make_state();
         let event = ClaudeEvent::System(SystemEvent {
             subtype: None,
@@ -563,13 +631,10 @@ mod tests {
         });
 
         let messages = map_event(&event, &mut state);
-        assert_eq!(messages.len(), 2);
-
-        assert_eq!(messages[0]["method"], "codex/connected");
-        assert_eq!(messages[0]["params"]["workspaceId"], "ws_test");
-
-        assert_eq!(messages[1]["method"], "thread/started");
-        assert_eq!(messages[1]["params"]["threadId"], "thread_test");
+        // codex/connected is emitted once in spawn_claude_session, not here
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["method"], "thread/started");
+        assert_eq!(messages[0]["params"]["threadId"], "thread_test");
 
         assert!(state.thread_started);
         assert_eq!(state.model.as_deref(), Some("claude-sonnet-4-20250514"));
@@ -588,7 +653,7 @@ mod tests {
         });
 
         let messages = map_event(&event, &mut state);
-        assert_eq!(messages.len(), 1); // only codex/connected
+        assert!(messages.is_empty()); // thread_started already true, nothing to emit
     }
 
     #[test]
@@ -788,7 +853,7 @@ mod tests {
         let msgs = map_event(&event, &mut state);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["method"], "thread/tokenUsage/updated");
-        assert_eq!(msgs[0]["params"]["usage"]["inputTokens"], 200);
+        assert_eq!(msgs[0]["params"]["tokenUsage"]["inputTokens"], 200);
     }
 
     // ── Phase 2: Tool Execution & Item Management ────────────────
@@ -841,8 +906,8 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["method"], "item/completed");
         assert_eq!(msgs[0]["params"]["itemId"], item_id);
-        assert_eq!(msgs[0]["params"]["status"], "completed");
-        assert_eq!(msgs[0]["params"]["command"], "ls -la");
+        assert_eq!(msgs[0]["params"]["item"]["status"], "completed");
+        assert_eq!(msgs[0]["params"]["item"]["command"], "ls -la");
     }
 
     #[test]
@@ -877,7 +942,7 @@ mod tests {
         let stop = ClaudeEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 });
         let msgs = map_event(&stop, &mut state);
         assert_eq!(msgs[0]["method"], "item/completed");
-        let changes = msgs[0]["params"]["changes"].as_array().unwrap();
+        let changes = msgs[0]["params"]["item"]["changes"].as_array().unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0]["path"], "src/main.rs");
         assert_eq!(changes[0]["kind"], "add");
@@ -909,7 +974,7 @@ mod tests {
 
         let stop = ClaudeEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 });
         let msgs = map_event(&stop, &mut state);
-        let changes = msgs[0]["params"]["changes"].as_array().unwrap();
+        let changes = msgs[0]["params"]["item"]["changes"].as_array().unwrap();
         assert_eq!(changes[0]["kind"], "modify");
     }
 
@@ -1085,9 +1150,9 @@ mod tests {
         let token_msg = msgs.iter()
             .find(|m| m["method"] == "thread/tokenUsage/updated")
             .unwrap();
-        assert_eq!(token_msg["params"]["usage"]["modelContextWindow"], 200_000);
-        assert_eq!(token_msg["params"]["usage"]["last"]["totalTokens"], 150);
-        assert_eq!(token_msg["params"]["usage"]["total"]["totalTokens"], 150);
+        assert_eq!(token_msg["params"]["tokenUsage"]["modelContextWindow"], 200_000);
+        assert_eq!(token_msg["params"]["tokenUsage"]["last"]["totalTokens"], 150);
+        assert_eq!(token_msg["params"]["tokenUsage"]["total"]["totalTokens"], 150);
     }
 
     #[test]
@@ -1107,9 +1172,9 @@ mod tests {
         let rate_msg = msgs.iter()
             .find(|m| m["method"] == "account/rateLimits/updated")
             .unwrap();
-        assert_eq!(rate_msg["params"]["credits"]["hasCredits"], true);
-        assert_eq!(rate_msg["params"]["credits"]["balance"], "$0.42 spent");
-        assert_eq!(rate_msg["params"]["planType"], "claude-cli");
+        assert_eq!(rate_msg["params"]["rateLimits"]["credits"]["hasCredits"], true);
+        assert_eq!(rate_msg["params"]["rateLimits"]["credits"]["balance"], "$0.42 spent");
+        assert_eq!(rate_msg["params"]["rateLimits"]["planType"], "claude-cli");
     }
 
     #[test]
@@ -1147,77 +1212,29 @@ mod tests {
             }),
         });
         let msgs = map_event(&event, &mut state);
-        assert_eq!(msgs[0]["params"]["usage"]["modelContextWindow"], 200_000);
+        assert_eq!(msgs[0]["params"]["tokenUsage"]["modelContextWindow"], 200_000);
     }
 
     // ── Phase 5: Additional edge-case tests ───────────────────────
 
     #[test]
-    fn assistant_text_subtype_produces_message_delta() {
+    fn assistant_event_extracts_model_only() {
         let mut state = make_state();
-        state.turn_started = true;
-
+        // With --include-partial-messages, assistant events are summary snapshots.
+        // map_assistant should only extract model and return vec![].
         let event = ClaudeEvent::Assistant(AssistantEvent {
             subtype: Some("text".to_string()),
-            message: Some(serde_json::json!("Hello from assistant")),
-            content_block: None,
-            extra: Default::default(),
-        });
-        let msgs = map_event(&event, &mut state);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["method"], "item/agentMessage/delta");
-        assert_eq!(msgs[0]["params"]["delta"], "Hello from assistant");
-        assert_eq!(state.accumulated_text, "Hello from assistant");
-    }
-
-    #[test]
-    fn assistant_text_creates_item_if_none_exists() {
-        let mut state = make_state();
-        assert!(state.block_items.is_empty());
-
-        let event = ClaudeEvent::Assistant(AssistantEvent {
-            subtype: Some("text".to_string()),
-            message: Some(serde_json::json!("First message")),
-            content_block: None,
-            extra: Default::default(),
-        });
-        let msgs = map_event(&event, &mut state);
-        assert_eq!(msgs.len(), 1);
-        // An item should have been auto-created
-        assert!(!state.block_items.is_empty());
-        assert_eq!(msgs[0]["params"]["itemId"], "item_1");
-    }
-
-    #[test]
-    fn assistant_text_reuses_existing_item() {
-        let mut state = make_state();
-        state.block_items.insert(0, "item_existing".to_string());
-
-        let event = ClaudeEvent::Assistant(AssistantEvent {
-            subtype: Some("text".to_string()),
-            message: Some(serde_json::json!("More text")),
-            content_block: None,
-            extra: Default::default(),
-        });
-        let msgs = map_event(&event, &mut state);
-        assert_eq!(msgs[0]["params"]["itemId"], "item_existing");
-    }
-
-    #[test]
-    fn assistant_non_text_subtype_produces_nothing() {
-        let mut state = make_state();
-        let event = ClaudeEvent::Assistant(AssistantEvent {
-            subtype: Some("other".to_string()),
-            message: Some(serde_json::json!("ignored")),
+            message: Some(serde_json::json!({"model": "claude-sonnet-4-20250514", "content": [{"type": "text", "text": "Hello"}]})),
             content_block: None,
             extra: Default::default(),
         });
         let msgs = map_event(&event, &mut state);
         assert!(msgs.is_empty());
+        assert_eq!(state.model.as_deref(), Some("claude-sonnet-4-20250514"));
     }
 
     #[test]
-    fn assistant_none_subtype_produces_nothing() {
+    fn assistant_event_without_model_produces_nothing() {
         let mut state = make_state();
         let event = ClaudeEvent::Assistant(AssistantEvent {
             subtype: None,
@@ -1438,7 +1455,7 @@ mod tests {
         });
         let msgs = map_event(&event, &mut state);
         let name_msg = msgs.iter().find(|m| m["method"] == "thread/name/updated").unwrap();
-        let name = name_msg["params"]["name"].as_str().unwrap();
+        let name = name_msg["params"]["threadName"].as_str().unwrap();
         assert_eq!(name.len(), 38);
     }
 
@@ -1515,5 +1532,122 @@ mod tests {
         });
         let msgs = map_event(&event, &mut state);
         assert!(msgs.is_empty());
+    }
+
+    // ── Phase 6: Control Request / Permission Prompt ─────────────
+
+    #[test]
+    fn control_request_bash_emits_request_approval() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::ControlRequest(super::super::types::ControlRequestData {
+            request_id: "req_abc".to_string(),
+            request: json!({
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "rm -rf /tmp/test"},
+                "tool_use_id": "toolu_01",
+                "description": "Run bash command: rm -rf /tmp/test"
+            }),
+        });
+
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["method"], "codex/requestApproval");
+        assert_eq!(msgs[0]["id"], 100_000);
+        assert_eq!(msgs[0]["params"]["tool"], "Bash");
+        assert_eq!(msgs[0]["params"]["command"][0], "Bash");
+        assert_eq!(msgs[0]["params"]["command"][1], "rm -rf /tmp/test");
+        assert_eq!(msgs[0]["params"]["threadId"], "thread_test");
+
+        // Verify pending request was stored
+        let pending = state.pending_control_requests.get(&100_000).unwrap();
+        assert_eq!(pending.claude_request_id, "req_abc");
+        assert_eq!(pending.tool_name, "Bash");
+    }
+
+    #[test]
+    fn control_request_ask_user_question_emits_request_user_input() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::ControlRequest(super::super::types::ControlRequestData {
+            request_id: "req_xyz".to_string(),
+            request: json!({
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": {
+                    "questions": [{
+                        "question": "Which lib?",
+                        "header": "Library",
+                        "options": [
+                            {"label": "axios", "description": "HTTP client"},
+                            {"label": "fetch", "description": "Built-in"}
+                        ]
+                    }]
+                },
+                "tool_use_id": "toolu_02"
+            }),
+        });
+
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["method"], "item/tool/requestUserInput");
+        assert_eq!(msgs[0]["id"], 100_000);
+        let questions = msgs[0]["params"]["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0]["question"], "Which lib?");
+
+        let pending = state.pending_control_requests.get(&100_000).unwrap();
+        assert_eq!(pending.tool_name, "AskUserQuestion");
+    }
+
+    #[test]
+    fn control_request_non_can_use_tool_produces_nothing() {
+        let mut state = make_state();
+        let event = ClaudeEvent::ControlRequest(super::super::types::ControlRequestData {
+            request_id: "req_other".to_string(),
+            request: json!({"subtype": "interrupt"}),
+        });
+        let msgs = map_event(&event, &mut state);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn control_request_write_tool_emits_approval() {
+        let mut state = make_state();
+        state.turn_started = true;
+
+        let event = ClaudeEvent::ControlRequest(super::super::types::ControlRequestData {
+            request_id: "req_write".to_string(),
+            request: json!({
+                "subtype": "can_use_tool",
+                "tool_name": "Write",
+                "input": {"file_path": "/src/main.rs", "content": "fn main() {}"},
+                "description": "Write file: /src/main.rs"
+            }),
+        });
+
+        let msgs = map_event(&event, &mut state);
+        assert_eq!(msgs[0]["method"], "codex/requestApproval");
+        assert_eq!(msgs[0]["params"]["tool"], "Write");
+        // command[1] should be the description since there's no "command" in input
+        assert_eq!(msgs[0]["params"]["command"][1], "Write file: /src/main.rs");
+    }
+
+    #[test]
+    fn multiple_control_requests_get_unique_ids() {
+        let mut state = make_state();
+
+        for i in 0..3 {
+            let event = ClaudeEvent::ControlRequest(super::super::types::ControlRequestData {
+                request_id: format!("req_{i}"),
+                request: json!({"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}),
+            });
+            let msgs = map_event(&event, &mut state);
+            assert_eq!(msgs[0]["id"], 100_000 + i as u64);
+        }
+        assert_eq!(state.pending_control_requests.len(), 3);
     }
 }

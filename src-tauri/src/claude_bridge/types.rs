@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,6 +43,10 @@ pub(crate) enum ClaudeEvent {
     #[serde(rename = "stream_event")]
     StreamEvent(StreamEventWrapper),
 
+    /// Permission prompt or AskUserQuestion from CLI.
+    #[serde(rename = "control_request")]
+    ControlRequest(ControlRequestData),
+
     /// Rate limit info (ignored).
     #[serde(rename = "rate_limit_event")]
     RateLimitEvent(RateLimitEventData),
@@ -55,13 +61,32 @@ pub(crate) struct StreamEventWrapper {
     #[serde(default)]
     pub(crate) event: Option<Value>,
     #[serde(flatten)]
-    pub(crate) _extra: std::collections::HashMap<String, Value>,
+    pub(crate) _extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RateLimitEventData {
     #[serde(flatten)]
-    pub(crate) _extra: std::collections::HashMap<String, Value>,
+    pub(crate) _extra: HashMap<String, Value>,
+}
+
+/// Data from a `control_request` event (permission prompt or AskUserQuestion).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ControlRequestData {
+    pub(crate) request_id: String,
+    #[serde(default)]
+    pub(crate) request: Value,
+}
+
+/// Tracks a pending control request awaiting user response.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingControlRequest {
+    /// Claude CLI's string request_id for correlation.
+    pub(crate) claude_request_id: String,
+    /// Tool name: "Bash", "AskUserQuestion", etc.
+    pub(crate) tool_name: String,
+    /// Full request payload (for building the response).
+    pub(crate) request: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,7 +101,7 @@ pub(crate) struct SystemEvent {
     pub(crate) model: Option<String>,
     /// Catch-all for extra fields.
     #[serde(flatten)]
-    pub(crate) extra: std::collections::HashMap<String, Value>,
+    pub(crate) extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,7 +113,7 @@ pub(crate) struct AssistantEvent {
     #[serde(default)]
     pub(crate) content_block: Option<Value>,
     #[serde(flatten)]
-    pub(crate) extra: std::collections::HashMap<String, Value>,
+    pub(crate) extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,7 +232,7 @@ pub(crate) struct MessageDeltaEvent {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MessageStopEvent {
     #[serde(flatten)]
-    pub(crate) extra: std::collections::HashMap<String, Value>,
+    pub(crate) extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,7 +258,7 @@ pub(crate) struct ResultEvent {
     #[serde(default)]
     pub(crate) usage: Option<UsageInfo>,
     #[serde(flatten)]
-    pub(crate) extra: std::collections::HashMap<String, Value>,
+    pub(crate) extra: HashMap<String, Value>,
 }
 
 /// State tracked across the lifetime of a Claude CLI session to correlate
@@ -245,9 +270,9 @@ pub(crate) struct BridgeState {
     /// Counter for generating unique item IDs.
     pub(crate) next_item_id: u64,
     /// Maps content block index to the item ID assigned for that block.
-    pub(crate) block_items: std::collections::HashMap<u64, String>,
+    pub(crate) block_items: HashMap<u64, String>,
     /// Maps content block index to the evolving item payload for non-tool blocks.
-    pub(crate) block_item_payloads: std::collections::HashMap<u64, Value>,
+    pub(crate) block_item_payloads: HashMap<u64, Value>,
     /// Accumulated text from assistant text blocks (for thread naming).
     pub(crate) accumulated_text: String,
     /// Whether `thread/started` has been emitted.
@@ -257,9 +282,9 @@ pub(crate) struct BridgeState {
     /// Model ID reported by Claude.
     pub(crate) model: Option<String>,
     /// Maps tool_use_id → ItemInfo for correlating tool results back to items.
-    pub(crate) tool_items: std::collections::HashMap<String, ItemInfo>,
+    pub(crate) tool_items: HashMap<String, ItemInfo>,
     /// Maps content block index → tool_use_id (to find ItemInfo from content block events).
-    pub(crate) block_tool_use_ids: std::collections::HashMap<u64, String>,
+    pub(crate) block_tool_use_ids: HashMap<u64, String>,
     /// Cumulative input tokens across all turns.
     pub(crate) total_input_tokens: u64,
     /// Cumulative output tokens across all turns.
@@ -270,6 +295,12 @@ pub(crate) struct BridgeState {
     pub(crate) last_assistant_msg_id: String,
     /// Number of content blocks already processed for `last_assistant_msg_id`.
     pub(crate) last_assistant_block_count: usize,
+    /// Pending control requests awaiting user approval (numeric ID → request info).
+    pub(crate) pending_control_requests: HashMap<u64, PendingControlRequest>,
+    /// Counter for generating approval IDs (starts at 100_000 to avoid collision).
+    pub(crate) approval_id_counter: u64,
+    /// Claude session ID from the system init event.
+    pub(crate) claude_session_id: Option<String>,
 }
 
 impl BridgeState {
@@ -279,25 +310,35 @@ impl BridgeState {
             turn_id,
             workspace_id,
             next_item_id: 1,
-            block_items: std::collections::HashMap::new(),
-            block_item_payloads: std::collections::HashMap::new(),
+            block_items: HashMap::new(),
+            block_item_payloads: HashMap::new(),
             accumulated_text: String::new(),
             thread_started: false,
             turn_started: false,
             model: None,
-            tool_items: std::collections::HashMap::new(),
-            block_tool_use_ids: std::collections::HashMap::new(),
+            tool_items: HashMap::new(),
+            block_tool_use_ids: HashMap::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cost_usd: 0.0,
             last_assistant_msg_id: String::new(),
             last_assistant_block_count: 0,
+            pending_control_requests: HashMap::new(),
+            approval_id_counter: 100_000,
+            claude_session_id: None,
         }
     }
 
     pub(crate) fn next_item(&mut self) -> String {
-        let id = format!("item_{}", self.next_item_id);
+        let id = format!("item_{}_{}", self.turn_id, self.next_item_id);
         self.next_item_id += 1;
+        id
+    }
+
+    /// Generate a unique approval ID for a control request.
+    pub(crate) fn next_approval_id(&mut self) -> u64 {
+        let id = self.approval_id_counter;
+        self.approval_id_counter += 1;
         id
     }
 
@@ -310,6 +351,8 @@ impl BridgeState {
         self.block_tool_use_ids.clear();
         self.last_assistant_msg_id.clear();
         self.last_assistant_block_count = 0;
+        // NOTE: pending_control_requests, approval_id_counter,
+        // claude_session_id are preserved across turns.
     }
 }
 
@@ -651,14 +694,25 @@ mod tests {
         assert_eq!(state.total_input_tokens, 0);
         assert_eq!(state.total_output_tokens, 0);
         assert!((state.total_cost_usd - 0.0).abs() < f64::EPSILON);
+        assert!(state.pending_control_requests.is_empty());
+        assert_eq!(state.approval_id_counter, 100_000);
+        assert!(state.claude_session_id.is_none());
     }
 
     #[test]
     fn bridge_state_next_item_increments() {
         let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_test".to_string());
-        assert_eq!(state.next_item(), "item_1");
-        assert_eq!(state.next_item(), "item_2");
-        assert_eq!(state.next_item(), "item_3");
+        let item1 = state.next_item();
+        let item2 = state.next_item();
+        let item3 = state.next_item();
+        // Items include turn_id to be globally unique
+        assert!(item1.starts_with("item_"));
+        assert!(item1.ends_with("_1"));
+        assert!(item2.ends_with("_2"));
+        assert!(item3.ends_with("_3"));
+        // All items are different
+        assert_ne!(item1, item2);
+        assert_ne!(item2, item3);
         assert_eq!(state.next_item_id, 4);
     }
 
@@ -697,9 +751,16 @@ mod tests {
         state.accumulated_text = "some text".to_string();
         state.model = Some("claude-sonnet-4-20250514".to_string());
         state.thread_started = true;
-        // next_item_id should persist across turns
-        let _ = state.next_item(); // item_1
-        let _ = state.next_item(); // item_2
+        let _ = state.next_item();
+        let _ = state.next_item();
+
+        // Add a pending control request
+        state.pending_control_requests.insert(100_000, PendingControlRequest {
+            claude_request_id: "req_1".to_string(),
+            tool_name: "Bash".to_string(),
+            request: json!({}),
+        });
+        state.claude_session_id = Some("sess_xyz".to_string());
 
         state.new_turn();
 
@@ -709,6 +770,50 @@ mod tests {
         assert_eq!(state.accumulated_text, "some text");
         assert_eq!(state.model.as_deref(), Some("claude-sonnet-4-20250514"));
         assert!(state.thread_started);
-        assert_eq!(state.next_item_id, 3); // preserved
+        assert_eq!(state.next_item_id, 3);
+        // Preserved across turns:
+        assert_eq!(state.pending_control_requests.len(), 1);
+        assert_eq!(state.claude_session_id.as_deref(), Some("sess_xyz"));
+    }
+
+    #[test]
+    fn bridge_state_next_approval_id_increments() {
+        let mut state = BridgeState::new("ws".to_string(), "t".to_string(), "turn_test".to_string());
+        assert_eq!(state.next_approval_id(), 100_000);
+        assert_eq!(state.next_approval_id(), 100_001);
+        assert_eq!(state.next_approval_id(), 100_002);
+    }
+
+    // ── ControlRequest deserialization ────────────────────────────
+
+    #[test]
+    fn deserialize_control_request_event() {
+        let json_str = r#"{"type":"control_request","request_id":"a1b2c3","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls -la"},"tool_use_id":"toolu_01","description":"Run bash command"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json_str).unwrap();
+        match event {
+            ClaudeEvent::ControlRequest(cr) => {
+                assert_eq!(cr.request_id, "a1b2c3");
+                assert_eq!(cr.request["subtype"], "can_use_tool");
+                assert_eq!(cr.request["tool_name"], "Bash");
+                assert_eq!(cr.request["input"]["command"], "ls -la");
+            }
+            _ => panic!("Expected ControlRequest event"),
+        }
+    }
+
+    #[test]
+    fn deserialize_control_request_ask_user_question() {
+        let json_str = r#"{"type":"control_request","request_id":"q123","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which lib?","header":"Library","options":[{"label":"axios"},{"label":"fetch"}]}]},"tool_use_id":"toolu_02"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json_str).unwrap();
+        match event {
+            ClaudeEvent::ControlRequest(cr) => {
+                assert_eq!(cr.request_id, "q123");
+                assert_eq!(cr.request["tool_name"], "AskUserQuestion");
+                let questions = cr.request["input"]["questions"].as_array().unwrap();
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions[0]["question"], "Which lib?");
+            }
+            _ => panic!("Expected ControlRequest event"),
+        }
     }
 }
