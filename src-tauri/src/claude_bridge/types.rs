@@ -343,7 +343,13 @@ impl BridgeState {
     }
 
     pub(crate) fn new_turn(&mut self) {
-        self.turn_id = format!("turn_{}", uuid::Uuid::new_v4());
+        self.new_turn_with_id(format!("turn_{}", uuid::Uuid::new_v4()));
+    }
+
+    /// Reset per-turn state with a specific turn ID (avoids generating
+    /// a random ID that would be immediately discarded by the caller).
+    pub(crate) fn new_turn_with_id(&mut self, turn_id: String) {
+        self.turn_id = turn_id;
         self.turn_started = false;
         self.block_items.clear();
         self.block_item_payloads.clear();
