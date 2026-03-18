@@ -260,7 +260,10 @@ fn resolve_transport_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{can_retry_after_disconnect, resolve_transport_config};
+    use super::{
+        can_retry_after_disconnect, normalize_path_for_remote, normalize_wsl_unc_path,
+        resolve_transport_config,
+    };
     use crate::remote_backend::transport::RemoteTransportConfig;
     use crate::types::{AppSettings, RemoteBackendProvider, RemoteBackendTarget};
 
@@ -329,5 +332,78 @@ mod tests {
         assert!(!can_retry_after_disconnect("send_user_message"));
         assert!(!can_retry_after_disconnect("start_thread"));
         assert!(!can_retry_after_disconnect("remove_workspace"));
+    }
+
+    // ── WSL path normalization ───────────────────────────────────
+
+    #[test]
+    fn normalize_wsl_dollar_path() {
+        let result = normalize_wsl_unc_path("\\\\wsl$\\Ubuntu\\home\\user\\project");
+        assert_eq!(result.as_deref(), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn normalize_wsl_localhost_path() {
+        let result = normalize_wsl_unc_path("\\\\wsl.localhost\\Ubuntu\\home\\user\\project");
+        assert_eq!(result.as_deref(), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn normalize_wsl_root_only() {
+        // Only distro name, no further path → root
+        assert_eq!(
+            normalize_wsl_unc_path("\\\\wsl$\\Ubuntu"),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            normalize_wsl_unc_path("\\\\wsl$\\Ubuntu\\"),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_wsl_case_insensitive_prefix() {
+        let result = normalize_wsl_unc_path("\\\\WSL$\\Ubuntu\\home");
+        assert_eq!(result.as_deref(), Some("/home"));
+
+        let result = normalize_wsl_unc_path("\\\\WSL.LOCALHOST\\Ubuntu\\tmp");
+        assert_eq!(result.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn normalize_wsl_bare_prefix_returns_none() {
+        assert!(normalize_wsl_unc_path("\\\\wsl$\\").is_none());
+    }
+
+    #[test]
+    fn normalize_wsl_non_wsl_path_returns_none() {
+        assert!(normalize_wsl_unc_path("C:\\Users\\me").is_none());
+        assert!(normalize_wsl_unc_path("/home/user").is_none());
+    }
+
+    #[test]
+    fn normalize_path_for_remote_passes_through_normal_paths() {
+        assert_eq!(
+            normalize_path_for_remote("C:\\Projects\\App".to_string()),
+            "C:\\Projects\\App"
+        );
+        assert_eq!(
+            normalize_path_for_remote("/home/user/project".to_string()),
+            "/home/user/project"
+        );
+    }
+
+    #[test]
+    fn normalize_path_for_remote_converts_wsl() {
+        assert_eq!(
+            normalize_path_for_remote("\\\\wsl$\\Ubuntu\\home\\user".to_string()),
+            "/home/user"
+        );
+    }
+
+    #[test]
+    fn normalize_path_for_remote_empty_string() {
+        assert_eq!(normalize_path_for_remote("".to_string()), "");
+        assert_eq!(normalize_path_for_remote("  ".to_string()), "  ");
     }
 }
