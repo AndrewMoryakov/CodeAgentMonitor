@@ -521,7 +521,7 @@ pub(crate) fn discover_models(workspace_path: &str) -> Vec<(String, String)> {
 
 /// Format a model ID into a human-readable name.
 /// `claude-opus-4-6` → `Claude Opus 4 6`, strips date suffixes like `-20251001`.
-fn format_model_name(id: &str) -> String {
+pub(crate) fn format_model_name(id: &str) -> String {
     let base = if let Some(pos) = id.rfind('-') {
         let suffix = &id[pos + 1..];
         if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -593,6 +593,16 @@ mod tests {
     #[test]
     fn format_model_name_single_segment() {
         assert_eq!(format_model_name("gpt4"), "Gpt4");
+    }
+
+    #[test]
+    fn format_model_name_with_non_date_suffix() {
+        assert_eq!(format_model_name("claude-sonnet-4-beta"), "Claude Sonnet 4 Beta");
+    }
+
+    #[test]
+    fn format_model_name_empty() {
+        assert_eq!(format_model_name(""), "");
     }
 
     // ── extract_user_text_from_content tests ─────────────────────

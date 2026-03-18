@@ -12,7 +12,9 @@ use crate::backend::events::{AppServerEvent, EventSink};
 use crate::types::WorkspaceEntry;
 
 use super::event_mapper;
-use super::history::{discover_models, read_claude_sessions, read_session_items, ClaudeSession};
+use super::history::{
+    discover_models, format_model_name, read_claude_sessions, read_session_items, ClaudeSession,
+};
 use super::types::BridgeState;
 
 /// Sentinel error returned when the Claude CLI process has exited unexpectedly.
@@ -166,8 +168,16 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
     ));
 
     // Spawn a dummy child process to satisfy WorkspaceSession's type requirements.
+    #[cfg(windows)]
     let mut dummy_child = Command::new("cmd")
         .args(["/c", "exit", "0"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn dummy process: {e}"))?;
+    #[cfg(not(windows))]
+    let mut dummy_child = Command::new("true")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -486,7 +496,9 @@ async fn stdin_writer_task(
             StdinMessage::ControlResponse(ndjson) => ndjson,
             StdinMessage::Interrupt => build_interrupt_request(),
         };
-        if stdin.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+        let mut buf = line.into_bytes();
+        buf.push(b'\n');
+        if stdin.write_all(&buf).await.is_err() {
             break;
         }
         if stdin.flush().await.is_err() {
@@ -656,12 +668,24 @@ async fn stdout_reader_task<E: EventSink>(
     }
 
     event_sink.emit_app_server_event(AppServerEvent {
-        workspace_id,
+        workspace_id: workspace_id.clone(),
         message: json!({
             "method": "thread/status/changed",
             "params": {
                 "threadId": thread_id,
                 "status": { "type": "idle" }
+            }
+        }),
+    });
+
+    // Notify frontend that the session is gone so it can show reconnect UI
+    // instead of silently failing on the next user message.
+    event_sink.emit_app_server_event(AppServerEvent {
+        workspace_id,
+        message: json!({
+            "method": "codex/disconnected",
+            "params": {
+                "reason": "Claude CLI process exited"
             }
         }),
     });
@@ -773,34 +797,6 @@ fn build_ask_user_response(
     })
 }
 
-/// Format a model ID like "claude-sonnet-4-20250514" into a display name
-/// like "Claude Sonnet 4".
-fn format_model_display_name(model_id: &str) -> String {
-    let base = if let Some(pos) = model_id.rfind('-') {
-        let suffix = &model_id[pos + 1..];
-        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            &model_id[..pos]
-        } else {
-            model_id
-        }
-    } else {
-        model_id
-    };
-    base.split('-')
-        .map(|s| {
-            let mut c = s.chars();
-            match c.next() {
-                None => String::new(),
-                Some(first) => {
-                    let upper: String = first.to_uppercase().collect();
-                    upper + c.as_str()
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Determine how to handle a JSON-RPC message destined for Claude CLI.
 fn build_claude_intercept_action(
     value: &Value,
@@ -874,7 +870,7 @@ fn build_claude_intercept_action(
                 let detected = detected_model.unwrap_or("");
                 let data: Vec<Value> = if models.is_empty() {
                     let fallback_id = if detected.is_empty() { "claude-sonnet-4-6" } else { detected };
-                    let display = format_model_display_name(fallback_id);
+                    let display = format_model_name(fallback_id);
                     vec![json!({
                         "id": fallback_id,
                         "model": fallback_id,
@@ -1198,26 +1194,6 @@ mod tests {
             }
             _ => panic!("Expected Respond with error"),
         }
-    }
-
-    #[test]
-    fn format_model_display_name_strips_date() {
-        assert_eq!(
-            format_model_display_name("claude-sonnet-4-20250514"),
-            "Claude Sonnet 4"
-        );
-        assert_eq!(
-            format_model_display_name("claude-opus-4-20250514"),
-            "Claude Opus 4"
-        );
-    }
-
-    #[test]
-    fn format_model_display_name_without_date() {
-        assert_eq!(
-            format_model_display_name("claude-haiku-4"),
-            "Claude Haiku 4"
-        );
     }
 
     #[test]
@@ -1649,24 +1625,6 @@ mod tests {
             "text": "from text field"
         });
         assert_eq!(extract_user_text(&params), "from input");
-    }
-
-    #[test]
-    fn format_model_display_name_single_segment() {
-        assert_eq!(format_model_display_name("claude"), "Claude");
-    }
-
-    #[test]
-    fn format_model_display_name_with_non_date_suffix() {
-        assert_eq!(
-            format_model_display_name("claude-sonnet-4-beta"),
-            "Claude Sonnet 4 Beta"
-        );
-    }
-
-    #[test]
-    fn format_model_display_name_empty() {
-        assert_eq!(format_model_display_name(""), "");
     }
 
     #[test]
