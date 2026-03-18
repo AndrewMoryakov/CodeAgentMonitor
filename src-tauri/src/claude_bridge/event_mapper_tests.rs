@@ -1218,3 +1218,116 @@ fn message_start_clears_block_maps() {
         "tool_items should be preserved across messages"
     );
 }
+
+// ── Tool result produces final item/completed with output ────────────
+
+#[test]
+fn tool_result_registers_in_block_tool_use_ids() {
+    let mut state = make_state();
+    state.turn_started = true;
+
+    // Pre-populate tool_items as if a tool_use block was processed in a previous message
+    state.tool_items.insert(
+        "toolu_01".to_string(),
+        crate::claude_bridge::item_tracker::ItemInfo {
+            item_id: "item_turn_test_1".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            tool_name: "Bash".to_string(),
+            category: crate::claude_bridge::item_tracker::ToolCategory::CommandExecution,
+            accumulated_input_json: r#"{"command":"ls -la"}"#.to_string(),
+            aggregated_output: String::new(),
+        },
+    );
+
+    // Simulate content_block_start with tool_result
+    let event = ClaudeEvent::ContentBlockStart(ContentBlockEvent {
+        index: 0,
+        content_block: Some(ContentBlock::ToolResult {
+            tool_use_id: Some("toolu_01".to_string()),
+            content: Some(serde_json::json!("total 8\ndrwxr-xr-x 2 user user")),
+        }),
+    });
+    let messages = map_event(&event, &mut state);
+
+    // Should emit output delta with tool result text
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["method"], "item/commandExecution/outputDelta");
+
+    // Should register in block_tool_use_ids for content_block_stop
+    assert_eq!(
+        state.block_tool_use_ids.get(&0),
+        Some(&"toolu_01".to_string())
+    );
+
+    // aggregated_output should contain the result
+    let info = state.tool_items.get("toolu_01").unwrap();
+    assert!(info.aggregated_output.contains("total 8"));
+}
+
+#[test]
+fn tool_result_stop_emits_final_item_completed_with_output() {
+    let mut state = make_state();
+    state.turn_started = true;
+
+    // Pre-populate tool_items with accumulated input and output
+    state.tool_items.insert(
+        "toolu_01".to_string(),
+        crate::claude_bridge::item_tracker::ItemInfo {
+            item_id: "item_turn_test_1".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            tool_name: "Bash".to_string(),
+            category: crate::claude_bridge::item_tracker::ToolCategory::CommandExecution,
+            accumulated_input_json: r#"{"command":"ls -la"}"#.to_string(),
+            aggregated_output: "total 8\ndrwxr-xr-x 2 user user".to_string(),
+        },
+    );
+
+    // Register tool_use_id at index 0 (as tool_result content_block_start would do)
+    state.block_tool_use_ids.insert(0, "toolu_01".to_string());
+
+    // Simulate content_block_stop for the tool_result block
+    let event = ClaudeEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 });
+    let messages = map_event(&event, &mut state);
+
+    // Should emit item/completed with the full output
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["method"], "item/completed");
+    let item = &messages[0]["params"]["item"];
+    assert_eq!(item["status"], "completed");
+    assert_eq!(item["command"], "ls -la");
+    assert!(item["aggregatedOutput"]
+        .as_str()
+        .unwrap()
+        .contains("total 8"));
+}
+
+#[test]
+fn tool_result_file_change_emits_completed_with_diff() {
+    let mut state = make_state();
+    state.turn_started = true;
+
+    state.tool_items.insert(
+        "toolu_02".to_string(),
+        crate::claude_bridge::item_tracker::ItemInfo {
+            item_id: "item_turn_test_2".to_string(),
+            tool_use_id: "toolu_02".to_string(),
+            tool_name: "Write".to_string(),
+            category: crate::claude_bridge::item_tracker::ToolCategory::FileChange,
+            accumulated_input_json: r#"{"path":"hello.txt","content":"Hello!"}"#.to_string(),
+            aggregated_output: "file written".to_string(),
+        },
+    );
+    state.block_tool_use_ids.insert(0, "toolu_02".to_string());
+
+    let event = ClaudeEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 });
+    let messages = map_event(&event, &mut state);
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["method"], "item/completed");
+    let item = &messages[0]["params"]["item"];
+    assert_eq!(item["type"], "fileChange");
+    let changes = item["changes"].as_array().unwrap();
+    assert_eq!(changes[0]["path"], "hello.txt");
+    assert_eq!(changes[0]["kind"], "add");
+    assert_eq!(changes[0]["diff"], "file written");
+}

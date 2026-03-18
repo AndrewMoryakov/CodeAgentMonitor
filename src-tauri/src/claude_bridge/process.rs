@@ -246,6 +246,13 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                             InterceptAction::Drop
                         };
                     }
+
+                    // For turn/steer, interrupt the current turn first so
+                    // Claude CLI doesn't receive a user message mid-processing.
+                    if method == "turn/steer" {
+                        let _ = interceptor_stdin_tx.send(StdinMessage::Interrupt);
+                    }
+
                     let tid = params
                         .get("threadId")
                         .and_then(|v| v.as_str())
@@ -284,6 +291,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                             "method": "item/started",
                             "params": {
                                 "threadId": &tid,
+                                "turnId": &turn_id,
                                 "item": {
                                     "id": user_item_id,
                                     "type": "userMessage",
@@ -703,6 +711,10 @@ fn build_tool_approval_response(
     let denied = decision == "decline";
 
     if denied {
+        let reason = result
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("User denied this action");
         json!({
             "type": "control_response",
             "response": {
@@ -710,7 +722,7 @@ fn build_tool_approval_response(
                 "request_id": pending.claude_request_id,
                 "response": {
                     "behavior": "deny",
-                    "message": "User denied this action"
+                    "message": reason
                 }
             }
         })
@@ -1629,6 +1641,19 @@ mod tests {
             request: json!({}),
         };
         let result = json!({"decision": "decline", "message": "Not safe"});
+        let msg = build_tool_approval_response(&pending, &result);
+        assert_eq!(msg["response"]["response"]["behavior"], "deny");
+        assert_eq!(msg["response"]["response"]["message"], "Not safe");
+    }
+
+    #[test]
+    fn build_tool_approval_deny_default_message() {
+        let pending = super::super::types::PendingControlRequest {
+            claude_request_id: "req_xyz".to_string(),
+            tool_name: "Bash".to_string(),
+            request: json!({}),
+        };
+        let result = json!({"decision": "decline"});
         let msg = build_tool_approval_response(&pending, &result);
         assert_eq!(msg["response"]["response"]["behavior"], "deny");
         assert_eq!(msg["response"]["response"]["message"], "User denied this action");

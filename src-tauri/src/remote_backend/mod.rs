@@ -135,10 +135,9 @@ pub(crate) async fn call_remote(
                 }
             }
         }
-        Err(err) => {
-            *state.remote_backend.lock().await = None;
-            Err(err)
-        }
+        // Non-disconnect errors (e.g. timeouts) do not invalidate the
+        // connection — keep the cached client alive.
+        Err(err) => Err(err),
     }
 }
 
@@ -184,11 +183,11 @@ fn can_retry_after_disconnect(method: &str) -> bool {
 }
 
 async fn ensure_remote_backend(state: &AppState, app: AppHandle) -> Result<RemoteBackend, String> {
-    {
-        let guard = state.remote_backend.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
-        }
+    // Hold lock across the entire connect+store sequence to prevent
+    // TOCTOU race where two callers both see None and connect twice.
+    let mut guard = state.remote_backend.lock().await;
+    if let Some(client) = guard.as_ref() {
+        return Ok(client.clone());
     }
 
     let transport_config = {
@@ -221,17 +220,33 @@ async fn ensure_remote_backend(state: &AppState, app: AppHandle) -> Result<Remot
         }
     }
 
-    {
-        let mut guard = state.remote_backend.lock().await;
-        *guard = Some(client.clone());
-    }
-
+    *guard = Some(client.clone());
     Ok(client)
 }
 
 fn resolve_transport_config(
     settings: &crate::types::AppSettings,
 ) -> Result<RemoteTransportConfig, String> {
+    // If an active backend is selected, look it up in the backends list.
+    if let Some(ref active_id) = settings.active_remote_backend_id {
+        if let Some(target) = settings
+            .remote_backends
+            .iter()
+            .find(|b| b.id == *active_id)
+        {
+            let host = if target.host.trim().is_empty() {
+                DEFAULT_REMOTE_HOST.to_string()
+            } else {
+                target.host.clone()
+            };
+            return Ok(RemoteTransportConfig::Tcp {
+                host,
+                auth_token: target.token.clone(),
+            });
+        }
+    }
+
+    // Fallback to flat settings fields.
     let host = if settings.remote_backend_host.trim().is_empty() {
         DEFAULT_REMOTE_HOST.to_string()
     } else {
@@ -247,7 +262,7 @@ fn resolve_transport_config(
 mod tests {
     use super::{can_retry_after_disconnect, resolve_transport_config};
     use crate::remote_backend::transport::RemoteTransportConfig;
-    use crate::types::AppSettings;
+    use crate::types::{AppSettings, RemoteBackendProvider, RemoteBackendTarget};
 
     #[test]
     fn resolve_tcp_transport_uses_remote_host() {
@@ -259,6 +274,51 @@ mod tests {
             panic!("expected tcp transport config");
         };
         assert_eq!(host, "tcp.example:4732");
+    }
+
+    #[test]
+    fn resolve_uses_active_backend_id() {
+        let mut settings = AppSettings::default();
+        settings.remote_backend_host = "fallback:4732".to_string();
+        settings.remote_backends = vec![
+            RemoteBackendTarget {
+                id: "prod".to_string(),
+                name: "Production".to_string(),
+                provider: RemoteBackendProvider::Tcp,
+                host: "prod.example:4732".to_string(),
+                token: Some("prod-token".to_string()),
+                last_connected_at_ms: None,
+            },
+            RemoteBackendTarget {
+                id: "staging".to_string(),
+                name: "Staging".to_string(),
+                provider: RemoteBackendProvider::Tcp,
+                host: "staging.example:4732".to_string(),
+                token: None,
+                last_connected_at_ms: None,
+            },
+        ];
+        settings.active_remote_backend_id = Some("staging".to_string());
+
+        let config = resolve_transport_config(&settings).expect("transport config");
+        let RemoteTransportConfig::Tcp { host, auth_token } = config else {
+            panic!("expected tcp transport config");
+        };
+        assert_eq!(host, "staging.example:4732");
+        assert!(auth_token.is_none());
+    }
+
+    #[test]
+    fn resolve_falls_back_when_active_id_not_found() {
+        let mut settings = AppSettings::default();
+        settings.remote_backend_host = "fallback:4732".to_string();
+        settings.active_remote_backend_id = Some("nonexistent".to_string());
+
+        let config = resolve_transport_config(&settings).expect("transport config");
+        let RemoteTransportConfig::Tcp { host, .. } = config else {
+            panic!("expected tcp transport config");
+        };
+        assert_eq!(host, "fallback:4732");
     }
 
     #[test]

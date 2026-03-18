@@ -74,9 +74,11 @@ where
 
     tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
-            if writer.write_all(message.as_bytes()).await.is_err()
-                || writer.write_all(b"\n").await.is_err()
-            {
+            // Combine message + newline into a single write to avoid
+            // partial sends and reduce syscall overhead.
+            let mut buf = message.into_bytes();
+            buf.push(b'\n');
+            if writer.write_all(&buf).await.is_err() {
                 mark_disconnected(&pending_for_writer, &connected_for_writer).await;
                 break;
             }

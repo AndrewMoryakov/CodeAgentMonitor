@@ -202,8 +202,12 @@ fn map_content_block_start(
             tool_use_id,
             content,
         } => {
-            // Map tool result content to output delta for the original item
+            // Map tool result content to output delta for the original item.
+            // Also register in block_tool_use_ids so content_block_stop emits
+            // a final item/completed with the full aggregated output.
             if let Some(ref tuid) = tool_use_id {
+                state.block_tool_use_ids.insert(cb.index, tuid.clone());
+
                 let result_text = extract_tool_result_text(content.as_ref());
                 if !result_text.is_empty() {
                     if let Some(info) = state.tool_items.get_mut(tuid) {
