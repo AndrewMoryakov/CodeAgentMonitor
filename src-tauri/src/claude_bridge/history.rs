@@ -195,38 +195,6 @@ fn extract_tool_result_text_from_content(content: &Value) -> String {
     String::new()
 }
 
-/// Build a human-readable command description for non-Bash tools.
-fn build_command_description(tool_name: &str, input: &Value) -> Option<String> {
-    match tool_name {
-        "Read" | "read_file" => {
-            let path = input
-                .get("file_path")
-                .or_else(|| input.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            Some(format!("Read: {path}"))
-        }
-        "Grep" => {
-            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            Some(format!("Grep: {pattern} in {path}"))
-        }
-        "Glob" => {
-            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-            Some(format!("Glob: {pattern}"))
-        }
-        "WebFetch" => {
-            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-            Some(format!("WebFetch: {url}"))
-        }
-        "WebSearch" => {
-            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("?");
-            Some(format!("WebSearch: {query}"))
-        }
-        _ => None,
-    }
-}
-
 /// Read conversation items from a Claude CLI JSONL session file.
 /// Returns items in the format expected by the frontend:
 /// `[{type: "userMessage", id, content}, {type: "agentMessage", id, text}, ...]`
@@ -429,7 +397,6 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
                             _ => {
                                 // commandExecution for Bash, Read, Grep, Glob, and others
                                 let command = item_tracker::extract_command(tool_name, &input)
-                                    .or_else(|| build_command_description(tool_name, &input))
                                     .unwrap_or_else(|| tool_name.to_string());
                                 items.push(json!({
                                     "type": "commandExecution",
@@ -715,28 +682,4 @@ mod tests {
         assert_eq!(extract_tool_result_text_from_content(&content), "line 1\nline 2");
     }
 
-    // ── build_command_description tests ──────────────────────────
-
-    #[test]
-    fn build_command_description_read() {
-        let input = json!({ "file_path": "/tmp/foo.rs" });
-        assert_eq!(
-            build_command_description("Read", &input),
-            Some("Read: /tmp/foo.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn build_command_description_grep() {
-        let input = json!({ "pattern": "TODO", "path": "src/" });
-        assert_eq!(
-            build_command_description("Grep", &input),
-            Some("Grep: TODO in src/".to_string())
-        );
-    }
-
-    #[test]
-    fn build_command_description_unknown_tool() {
-        assert_eq!(build_command_description("CustomTool", &json!({})), None);
-    }
 }

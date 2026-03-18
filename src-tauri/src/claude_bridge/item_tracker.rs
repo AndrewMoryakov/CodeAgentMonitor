@@ -51,15 +51,41 @@ pub(crate) struct ItemInfo {
     pub(crate) aggregated_output: String,
 }
 
-/// Extract a command string from the parsed tool input JSON.
+/// Extract a human-readable command description from the parsed tool input JSON.
 ///
-/// Works for bash/execute_command tools where `input.command` holds the command.
+/// For bash-family tools returns the shell command; for other known tools
+/// returns a descriptive string like `"Read: /path/file.rs"`.
 pub(crate) fn extract_command(tool_name: &str, input: &Value) -> Option<String> {
     match tool_name {
         "bash" | "Bash" | "execute_command" | "shell" | "run_command" => input
             .get("command")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        "Read" | "read_file" => {
+            let path = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            Some(format!("Read: {path}"))
+        }
+        "Grep" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            Some(format!("Grep: {pattern} in {path}"))
+        }
+        "Glob" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("Glob: {pattern}"))
+        }
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("WebFetch: {url}"))
+        }
+        "WebSearch" => {
+            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("WebSearch: {query}"))
+        }
         _ => None,
     }
 }
@@ -281,6 +307,47 @@ mod tests {
     fn extract_command_returns_none_when_field_missing() {
         let input = json!({"other": "value"});
         assert_eq!(extract_command("bash", &input), None);
+    }
+
+    #[test]
+    fn extract_command_read_with_file_path() {
+        let input = json!({"file_path": "/tmp/foo.rs"});
+        assert_eq!(extract_command("Read", &input), Some("Read: /tmp/foo.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_command_read_file_with_path_key() {
+        let input = json!({"path": "/tmp/bar.rs"});
+        assert_eq!(extract_command("read_file", &input), Some("Read: /tmp/bar.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_command_grep() {
+        let input = json!({"pattern": "TODO", "path": "src/"});
+        assert_eq!(extract_command("Grep", &input), Some("Grep: TODO in src/".to_string()));
+    }
+
+    #[test]
+    fn extract_command_glob() {
+        let input = json!({"pattern": "**/*.rs"});
+        assert_eq!(extract_command("Glob", &input), Some("Glob: **/*.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_command_web_fetch() {
+        let input = json!({"url": "https://example.com"});
+        assert_eq!(extract_command("WebFetch", &input), Some("WebFetch: https://example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_command_web_search() {
+        let input = json!({"query": "rust async"});
+        assert_eq!(extract_command("WebSearch", &input), Some("WebSearch: rust async".to_string()));
+    }
+
+    #[test]
+    fn extract_command_unknown_tool_returns_none() {
+        assert_eq!(extract_command("CustomTool", &json!({})), None);
     }
 
     // ── extract_file_path ────────────────────────────────────────
