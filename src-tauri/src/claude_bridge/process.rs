@@ -346,11 +346,15 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
 
                 "thread/list" => {
                     if let Some(id) = id {
-                        let hist = sessions_for_interceptor
-                            .lock()
-                            .ok()
-                            .map(|s| s.clone())
-                            .unwrap_or_default();
+                        // Refresh sessions from disk so newly created
+                        // sessions (e.g. from CLI or VS Code) are visible.
+                        let hist = {
+                            let mut guard = sessions_for_interceptor
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            *guard = read_claude_sessions(&interceptor_workspace_path);
+                            guard.clone()
+                        };
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

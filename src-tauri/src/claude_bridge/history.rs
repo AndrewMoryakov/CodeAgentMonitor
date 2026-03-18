@@ -32,7 +32,10 @@ fn read_session_name_from_jsonl(path: &std::path::Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     for line in reader.lines().take(30) {
-        let line = line.ok()?;
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -146,26 +149,18 @@ fn extract_user_text_from_content(content: &Value) -> String {
     String::new()
 }
 
-/// Collect assistant text blocks for a given message ID, aggregating across
-/// multiple JSONL lines that share the same `message.id`.
-fn collect_assistant_text(msg_id: &str, lines: &[Value]) -> String {
+/// Collect assistant text blocks from pre-grouped JSONL lines sharing the
+/// same `message.id`.
+fn collect_assistant_text_from_group(lines: &[&Value]) -> String {
     let mut parts = Vec::new();
     for obj in lines {
-        if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-            continue;
-        }
         let msg = match obj.get("message") {
             Some(m) => m,
             None => continue,
         };
-        let this_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if this_id != msg_id {
-            continue;
-        }
         if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
             for block in content_arr {
-                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if block_type == "text" {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
@@ -295,6 +290,22 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
         }
     }
 
+    // ── Pass 1.5: group assistant lines by message.id ──────────
+    let mut assistant_lines: HashMap<String, Vec<&Value>> = HashMap::new();
+    for obj in &parsed {
+        if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let msg = match obj.get("message") {
+            Some(m) if m.is_object() => m,
+            _ => continue,
+        };
+        let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !msg_id.is_empty() {
+            assistant_lines.entry(msg_id.to_string()).or_default().push(obj);
+        }
+    }
+
     // ── Pass 2: build items ───────────────────────────────────────
     let mut items = Vec::new();
     let mut seen_assistant_ids = std::collections::HashSet::new();
@@ -346,8 +357,13 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
                 }
                 seen_assistant_ids.insert(msg_id.to_string());
 
-                // Aggregate all text blocks for this message ID across JSONL lines.
-                let full_text = collect_assistant_text(msg_id, &parsed);
+                let group = assistant_lines
+                    .get(msg_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+
+                // Aggregate all text blocks for this message ID.
+                let full_text = collect_assistant_text_from_group(group);
                 if !full_text.is_empty() {
                     item_counter += 1;
                     items.push(json!({
@@ -357,20 +373,12 @@ pub(crate) fn read_session_items(workspace_path: &str, session_id: &str) -> Vec<
                     }));
                 }
 
-                // Scan all content blocks for tool_use entries across all
-                // JSONL lines sharing this message ID.
-                for line_obj in &parsed {
-                    if line_obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                        continue;
-                    }
+                // Scan tool_use blocks from grouped lines only.
+                for line_obj in group {
                     let line_msg = match line_obj.get("message") {
                         Some(m) => m,
                         None => continue,
                     };
-                    let line_id = line_msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if line_id != msg_id {
-                        continue;
-                    }
                     let content_arr = match line_msg.get("content").and_then(|c| c.as_array()) {
                         Some(arr) => arr,
                         None => continue,
@@ -568,7 +576,8 @@ fn format_model_name(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_workspace_path;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn encodes_windows_path() {
@@ -594,5 +603,134 @@ mod tests {
             encode_workspace_path(r"Z:\files\projects\LifeBook\Life book"),
             "Z--files-projects-LifeBook-Life-book"
         );
+    }
+
+    // ── format_model_name tests ──────────────────────────────────
+
+    #[test]
+    fn format_model_name_strips_date_suffix() {
+        assert_eq!(format_model_name("claude-sonnet-4-5-20251001"), "Claude Sonnet 4 5");
+    }
+
+    #[test]
+    fn format_model_name_preserves_no_date() {
+        assert_eq!(format_model_name("claude-opus-4-6"), "Claude Opus 4 6");
+    }
+
+    #[test]
+    fn format_model_name_single_segment() {
+        assert_eq!(format_model_name("gpt4"), "Gpt4");
+    }
+
+    // ── extract_user_text_from_content tests ─────────────────────
+
+    #[test]
+    fn extract_user_text_string_content() {
+        let content = json!("Hello world");
+        assert_eq!(extract_user_text_from_content(&content), "Hello world");
+    }
+
+    #[test]
+    fn extract_user_text_array_content() {
+        let content = json!([
+            { "type": "text", "text": "First" },
+            { "type": "image", "url": "http://example.com" },
+            { "type": "text", "text": "Second" }
+        ]);
+        assert_eq!(extract_user_text_from_content(&content), "First\nSecond");
+    }
+
+    #[test]
+    fn extract_user_text_empty_array() {
+        let content = json!([{ "type": "tool_result", "tool_use_id": "abc" }]);
+        assert_eq!(extract_user_text_from_content(&content), "");
+    }
+
+    // ── collect_assistant_text_from_group tests ──────────────────
+
+    #[test]
+    fn collect_assistant_text_aggregates_across_lines() {
+        let line1 = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Hello" }]
+            }
+        });
+        let line2 = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "World" },
+                    { "type": "tool_use", "id": "tu_1", "name": "Bash", "input": {} }
+                ]
+            }
+        });
+        let group: Vec<&Value> = vec![&line1, &line2];
+        assert_eq!(collect_assistant_text_from_group(&group), "Hello\n\nWorld");
+    }
+
+    #[test]
+    fn collect_assistant_text_skips_empty_and_whitespace() {
+        let line = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "   " },
+                    { "type": "text", "text": "Real text" }
+                ]
+            }
+        });
+        let group: Vec<&Value> = vec![&line];
+        assert_eq!(collect_assistant_text_from_group(&group), "Real text");
+    }
+
+    // ── extract_tool_result_text_from_content tests ──────────────
+
+    #[test]
+    fn extract_tool_result_text_string() {
+        assert_eq!(
+            extract_tool_result_text_from_content(&json!("output text")),
+            "output text"
+        );
+    }
+
+    #[test]
+    fn extract_tool_result_text_array() {
+        let content = json!([
+            { "type": "text", "text": "line 1" },
+            { "type": "text", "text": "line 2" }
+        ]);
+        assert_eq!(extract_tool_result_text_from_content(&content), "line 1\nline 2");
+    }
+
+    // ── build_command_description tests ──────────────────────────
+
+    #[test]
+    fn build_command_description_read() {
+        let input = json!({ "file_path": "/tmp/foo.rs" });
+        assert_eq!(
+            build_command_description("Read", &input),
+            Some("Read: /tmp/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn build_command_description_grep() {
+        let input = json!({ "pattern": "TODO", "path": "src/" });
+        assert_eq!(
+            build_command_description("Grep", &input),
+            Some("Grep: TODO in src/".to_string())
+        );
+    }
+
+    #[test]
+    fn build_command_description_unknown_tool() {
+        assert_eq!(build_command_description("CustomTool", &json!({})), None);
     }
 }
