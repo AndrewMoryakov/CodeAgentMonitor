@@ -379,9 +379,10 @@ mod tests {
         assert_eq!(event["method"], "item/completed");
         let params = &event["params"];
         assert_eq!(params["itemId"], "item_3");
-        assert_eq!(params["status"], "completed");
-        assert_eq!(params["command"], "ls -la");
-        assert!(params["aggregatedOutput"].as_str().unwrap().contains("total 8"));
+        let item = &params["item"];
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["command"], "ls -la");
+        assert!(item["aggregatedOutput"].as_str().unwrap().contains("total 8"));
     }
 
     #[test]
@@ -396,8 +397,9 @@ mod tests {
         };
         let event = build_item_completed(&info, "thread_1", "turn_1");
         let params = &event["params"];
-        assert_eq!(params["status"], "completed");
-        let changes = params["changes"].as_array().unwrap();
+        let item = &params["item"];
+        assert_eq!(item["status"], "completed");
+        let changes = item["changes"].as_array().unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0]["path"], "src/main.rs");
         assert_eq!(changes[0]["kind"], "add");
@@ -415,7 +417,7 @@ mod tests {
                 .into(),
         };
         let event = build_item_completed(&info, "thread_1", "turn_1");
-        let changes = event["params"]["changes"].as_array().unwrap();
+        let changes = event["params"]["item"]["changes"].as_array().unwrap();
         assert_eq!(changes[0]["kind"], "modify");
         assert!(changes[0]["diff"].as_str().unwrap().contains("--- a/src/lib.rs"));
     }
@@ -466,7 +468,7 @@ mod tests {
         };
         let event = build_item_completed(&info, "t1", "turn1");
         // Should not panic, gracefully handles invalid JSON
-        assert_eq!(event["params"]["status"], "completed");
-        assert_eq!(event["params"]["aggregatedOutput"], "some output");
+        assert_eq!(event["params"]["item"]["status"], "completed");
+        assert_eq!(event["params"]["item"]["aggregatedOutput"], "some output");
     }
 }
