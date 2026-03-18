@@ -404,15 +404,8 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                             });
                         let preview = session_name.unwrap_or_else(|| "New conversation".to_string());
                         let items = read_session_items(&interceptor_workspace_path, tid);
-                        let turns = if items.is_empty() {
-                            json!([])
-                        } else {
-                            json!([{
-                                "id": format!("turn-resume-{tid}"),
-                                "status": "completed",
-                                "items": items
-                            }])
-                        };
+                        // Group flat items into turns: each userMessage starts a new turn.
+                        let turns = group_items_into_turns(tid, items);
                         InterceptAction::Respond(json!({
                             "id": id,
                             "result": {
@@ -996,6 +989,46 @@ fn extract_user_text(params: &Value) -> String {
     String::new()
 }
 
+/// Group a flat list of history items into turns.
+/// Each `userMessage` starts a new turn; preceding agent/tool items without
+/// a user message go into an initial turn.
+fn group_items_into_turns(thread_id: &str, items: Vec<Value>) -> Value {
+    if items.is_empty() {
+        return json!([]);
+    }
+
+    let mut turns: Vec<Value> = Vec::new();
+    let mut current_items: Vec<Value> = Vec::new();
+    let mut turn_counter: u64 = 0;
+
+    for item in items {
+        let is_user_msg = item.get("type").and_then(|v| v.as_str()) == Some("userMessage");
+        if is_user_msg && !current_items.is_empty() {
+            // Flush accumulated items as a completed turn.
+            turn_counter += 1;
+            turns.push(json!({
+                "id": format!("turn-resume-{thread_id}-{turn_counter}"),
+                "status": "completed",
+                "items": current_items
+            }));
+            current_items = Vec::new();
+        }
+        current_items.push(item);
+    }
+
+    // Flush remaining items.
+    if !current_items.is_empty() {
+        turn_counter += 1;
+        turns.push(json!({
+            "id": format!("turn-resume-{thread_id}-{turn_counter}"),
+            "status": "completed",
+            "items": current_items
+        }));
+    }
+
+    json!(turns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,6 +1054,66 @@ mod tests {
     fn extract_user_text_empty_when_missing() {
         let params = json!({});
         assert_eq!(extract_user_text(&params), "");
+    }
+
+    // ── group_items_into_turns tests ─────────────────────────────
+
+    #[test]
+    fn group_items_into_turns_empty() {
+        let result = group_items_into_turns("t1", vec![]);
+        assert_eq!(result, json!([]));
+    }
+
+    #[test]
+    fn group_items_into_turns_single_turn() {
+        let items = vec![
+            json!({ "type": "userMessage", "id": "u1" }),
+            json!({ "type": "agentMessage", "id": "a1" }),
+            json!({ "type": "commandExecution", "id": "c1" }),
+        ];
+        let turns = group_items_into_turns("t1", items);
+        let arr = turns.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["items"].as_array().unwrap().len(), 3);
+        assert!(arr[0]["id"].as_str().unwrap().contains("t1"));
+    }
+
+    #[test]
+    fn group_items_into_turns_multiple_turns() {
+        let items = vec![
+            json!({ "type": "userMessage", "id": "u1" }),
+            json!({ "type": "agentMessage", "id": "a1" }),
+            json!({ "type": "userMessage", "id": "u2" }),
+            json!({ "type": "agentMessage", "id": "a2" }),
+            json!({ "type": "commandExecution", "id": "c1" }),
+        ];
+        let turns = group_items_into_turns("t1", items);
+        let arr = turns.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // First turn: userMessage + agentMessage
+        assert_eq!(arr[0]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(arr[0]["items"][0]["id"], "u1");
+        // Second turn: userMessage + agentMessage + commandExecution
+        assert_eq!(arr[1]["items"].as_array().unwrap().len(), 3);
+        assert_eq!(arr[1]["items"][0]["id"], "u2");
+    }
+
+    #[test]
+    fn group_items_into_turns_leading_agent_items() {
+        // Agent items before any user message go into the first turn.
+        let items = vec![
+            json!({ "type": "agentMessage", "id": "a0" }),
+            json!({ "type": "userMessage", "id": "u1" }),
+            json!({ "type": "agentMessage", "id": "a1" }),
+        ];
+        let turns = group_items_into_turns("t1", items);
+        let arr = turns.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // First turn: just the leading agent item
+        assert_eq!(arr[0]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(arr[0]["items"][0]["id"], "a0");
+        // Second turn: user + agent
+        assert_eq!(arr[1]["items"].as_array().unwrap().len(), 2);
     }
 
     #[test]

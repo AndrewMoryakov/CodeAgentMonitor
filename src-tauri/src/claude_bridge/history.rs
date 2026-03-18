@@ -460,24 +460,30 @@ pub(crate) fn discover_models(workspace_path: &str) -> Vec<(String, String)> {
         None => return Vec::new(),
     };
 
-    // Scan ALL projects so we find every model the user has access to,
-    // not just ones used in the current workspace.
-    let project_dirs: Vec<_> = match std::fs::read_dir(&root) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    // Scan projects to find every model the user has access to.
+    // Current workspace is checked first; remaining dirs are capped to
+    // avoid long blocking scans when there are many projects.
+    const MAX_PROJECT_DIRS: usize = 20;
+    const MAX_FILES_PER_DIR: usize = 5;
+    const MAX_LINES_PER_FILE: usize = 10;
 
-    // Also include the current workspace directly in case it's not listed.
     let encoded = encode_workspace_path(workspace_path);
     let current_project = root.join(&encoded);
 
-    let mut all_dirs = project_dirs;
-    if current_project.is_dir() && !all_dirs.iter().any(|d| d == &current_project) {
-        all_dirs.insert(0, current_project);
+    let mut all_dirs: Vec<PathBuf> = Vec::new();
+    if current_project.is_dir() {
+        all_dirs.push(current_project.clone());
+    }
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p != current_project {
+                all_dirs.push(p);
+                if all_dirs.len() >= MAX_PROJECT_DIRS {
+                    break;
+                }
+            }
+        }
     }
 
     let mut seen_order: Vec<String> = Vec::new();
@@ -504,14 +510,14 @@ pub(crate) fn discover_models(workspace_path: &str) -> Vec<(String, String)> {
         // Newest first.
         paths.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Sample first few lines of each file (model appears early in the conversation).
-        for (path, _) in paths.iter().take(10) {
+        // Sample first few lines of each file (model appears early).
+        for (path, _) in paths.iter().take(MAX_FILES_PER_DIR) {
             use std::io::BufRead;
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
-            for line in std::io::BufReader::new(file).lines().take(20) {
+            for line in std::io::BufReader::new(file).lines().take(MAX_LINES_PER_FILE) {
                 let line = match line {
                     Ok(l) => l,
                     Err(_) => break,
