@@ -21,7 +21,11 @@ pub(crate) const PROCESS_EXITED_ERROR: &str = "CLAUDE_PROCESS_EXITED";
 /// Messages sent to the stdin writer task.
 enum StdinMessage {
     /// A new user prompt for a conversation turn.
-    UserMessage { text: String, uuid: String },
+    UserMessage {
+        text: String,
+        uuid: String,
+        session_id: String,
+    },
     /// A pre-serialized NDJSON line (control_response).
     ControlResponse(String),
     /// Interrupt the current turn.
@@ -264,12 +268,13 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                     // Reset bridge state for new turn and mark turn as started
                     // immediately. This ensures map_result() emits turn/completed
                     // even if Claude errors before sending message_start.
-                    {
+                    let session_id = {
                         let mut bs = interceptor_bridge_state.lock().unwrap();
                         bs.thread_id = tid.clone();
                         bs.new_turn_with_id(turn_id.clone());
                         bs.turn_started = true;
-                    }
+                        bs.claude_session_id.clone().unwrap_or_default()
+                    };
 
                     // Emit turn/started so frontend tracks this turn.
                     interceptor_event_sink.emit_app_server_event(AppServerEvent {
@@ -307,6 +312,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
                     let _ = interceptor_stdin_tx.send(StdinMessage::UserMessage {
                         text,
                         uuid,
+                        session_id,
                     });
 
                     if let Some(id) = id {
@@ -475,7 +481,11 @@ async fn stdin_writer_task(
 ) {
     while let Some(msg) = rx.recv().await {
         let line = match msg {
-            StdinMessage::UserMessage { text, uuid } => build_user_message(&text, &uuid),
+            StdinMessage::UserMessage {
+                text,
+                uuid,
+                session_id,
+            } => build_user_message(&text, &uuid, &session_id),
             StdinMessage::ControlResponse(ndjson) => ndjson,
             StdinMessage::Interrupt => build_interrupt_request(),
         };
@@ -661,7 +671,7 @@ async fn stdout_reader_task<E: EventSink>(
 }
 
 /// Build a Claude NDJSON user message.
-fn build_user_message(text: &str, uuid: &str) -> String {
+fn build_user_message(text: &str, uuid: &str, session_id: &str) -> String {
     let msg = json!({
         "type": "user",
         "message": {
@@ -670,7 +680,7 @@ fn build_user_message(text: &str, uuid: &str) -> String {
         },
         "uuid": uuid,
         "parent_tool_use_id": null,
-        "session_id": ""
+        "session_id": session_id
     });
     serde_json::to_string(&msg).unwrap_or_default()
 }
@@ -1602,12 +1612,20 @@ mod tests {
 
     #[test]
     fn build_user_message_produces_valid_ndjson() {
-        let msg = build_user_message("Hello world", "uuid-123");
+        let msg = build_user_message("Hello world", "uuid-123", "sess_abc");
         let parsed: Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(parsed["type"], "user");
         assert_eq!(parsed["message"]["role"], "user");
         assert_eq!(parsed["message"]["content"], "Hello world");
         assert_eq!(parsed["uuid"], "uuid-123");
+        assert_eq!(parsed["session_id"], "sess_abc");
+    }
+
+    #[test]
+    fn build_user_message_empty_session_id() {
+        let msg = build_user_message("Hi", "uuid-456", "");
+        let parsed: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["session_id"], "");
     }
 
     #[test]
