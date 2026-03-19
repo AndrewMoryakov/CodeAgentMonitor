@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::backend::app_server::{InterceptAction, WorkspaceSession};
 use crate::backend::events::{AppServerEvent, EventSink};
+use crate::shared::process_core::tokio_command;
 use crate::types::WorkspaceEntry;
 
 use super::event_mapper;
@@ -37,7 +37,7 @@ enum StdinMessage {
 /// Check that the `claude` CLI binary is available.
 #[tauri::command]
 pub(crate) async fn check_claude_installation() -> Result<String, String> {
-    let result = Command::new("claude")
+    let result = tokio_command("claude")
         .arg("--version")
         .output()
         .await
@@ -99,7 +99,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
         .map(|home| crate::rules::default_rules_path(&home));
 
     // Spawn the persistent Claude CLI process.
-    let mut child = Command::new("claude")
+    let mut child = tokio_command("claude")
         .args([
             "--print",
             "--input-format", "stream-json",
@@ -169,7 +169,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
 
     // Spawn a dummy child process to satisfy WorkspaceSession's type requirements.
     #[cfg(windows)]
-    let mut dummy_child = Command::new("cmd")
+    let mut dummy_child = tokio_command("cmd")
         .args(["/c", "exit", "0"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -177,7 +177,7 @@ pub(crate) async fn spawn_claude_session<E: EventSink>(
         .spawn()
         .map_err(|e| format!("Failed to spawn dummy process: {e}"))?;
     #[cfg(not(windows))]
-    let mut dummy_child = Command::new("true")
+    let mut dummy_child = tokio_command("true")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
